@@ -1,0 +1,164 @@
+[trainer]
+name = "whoop-linear"
+port = "auto"
+seconds = 0
+frame_rate_hz = 8000
+
+resolution_mode = "gx12_2x"
+[mapper]
+roll_gain = 0.3
+pitch_gain = 0.3
+max_output = 512
+deadband = 0
+expo = 0
+smoothing = 0.0
+invert_roll = false
+invert_pitch = true
+swap_axes = false
+
+return_enabled = false
+return_rate = 0
+return_idle_ms = 0
+constant_return_enabled = false
+constant_return_rate = 0
+elastic_return_enabled = true
+elastic_return_mode = "linear"
+elastic_return_coefficient = 12
+elastic_return_curve = 0
+output_shaping_enabled = false
+output_shape_nodes = []
+return_shaping_enabled = false
+return_shape_nodes = []
+
+position_model = "integrator"
+gimbal_frequency_hz = 5
+gimbal_damping_ratio = 1.15
+gimbal_input_impulse = 1.0
+gimbal_static_friction = 0.0
+gimbal_dynamic_friction = 0.0
+gimbal_edge_bumper = 0.0
+input_gain_mode = "flat"
+adaptive_slow_gain = 0.65
+adaptive_fast_gain = 1.60
+adaptive_speed_low = 120.0
+adaptive_speed_high = 1800.0
+adaptive_curve = 1.0
+adaptive_tracker_ms = 35.0
+gate_shape = "axis"
+diagonal_scale = 1.0
+input_filter = "off"
+one_euro_min_cutoff_hz = 1.0
+one_euro_beta = 0.05
+one_euro_dcutoff_hz = 1.0
+despike_enabled = true
+despike_window = 5
+despike_threshold_sigma = 3.0
+output_curve = "expo"
+actual_center = 0.45
+actual_max = 1.0
+actual_expo = 0.30
+gimbal_antiwindup_enabled = true
+gimbal_antiwindup_start = 0.92
+gimbal_antiwindup_min_gain = 0.10
+despike_count_enabled = false
+[keyboard_left_stick]
+enabled = false
+throttle_up_key = "W"
+throttle_down_key = "Space"
+throttle_cut_key = "VK20"
+throttle_rate = 4096
+yaw_left_key = "A"
+yaw_right_key = "D"
+yaw_pulse = 512
+yaw_slew_rate = 4096.0
+invert_yaw = false
+
+block_selected_keys = false
+throttle_return_enabled = false
+throttle_return_rate = 0.0
+input_source = "gameinput"
+require_analog = false
+analog_keycode_mode = "virtual_key_translate"
+analog_deadzone = 0.04
+analog_curve = 1.0
+analog_min = 0.0
+analog_max = 1.0
+[logging]
+csv = true
+path = "logs\\whoop-linear.csv"
+every_n_frames = 1
+
+[mouse_right_stick]
+enabled = true
+
+[mouse_devices]
+right = "auto"
+left = "auto"
+
+[mouse_left_stick]
+enabled = false
+require_device = true
+throttle_rate = 0.7
+throttle_return_enabled = false
+throttle_return_rate = 768.0
+yaw_gain = 0.7
+yaw_pulse = 512
+yaw_deadband = 0
+yaw_smoothing = 0.0
+yaw_slew_rate = 0.0
+yaw_shaping_enabled = true
+yaw_return_enabled = false
+yaw_return_rate = 0.0
+yaw_return_idle_ms = 0
+yaw_constant_return_enabled = false
+yaw_constant_return_rate = 0.0
+yaw_elastic_return_enabled = true
+yaw_elastic_return_mode = "linear"
+yaw_elastic_return_coefficient = 12
+yaw_elastic_return_curve = 0
+invert_throttle = false
+invert_yaw = false
+swap_axes = false
+
+yaw_input_filter = "off"
+yaw_one_euro_min_cutoff_hz = 1.0
+yaw_one_euro_beta = 0.05
+yaw_one_euro_dcutoff_hz = 1.0
+yaw_despike_enabled = false
+yaw_despike_count_enabled = false
+yaw_despike_window = 5
+yaw_despike_threshold_sigma = 3.0
+yaw_output_curve = "expo"
+yaw_expo = 0.0
+yaw_actual_center = 0.45
+yaw_actual_max = 1.0
+yaw_actual_expo = 0.30
+yaw_position_model = "integrator"
+yaw_gimbal_frequency_hz = 5.0
+yaw_gimbal_damping_ratio = 1.15
+yaw_gimbal_input_impulse = 1.0
+yaw_gimbal_static_friction = 0.0
+yaw_gimbal_dynamic_friction = 0.0
+yaw_gimbal_edge_bumper = 0.0
+yaw_gimbal_antiwindup_enabled = true
+yaw_gimbal_antiwindup_start = 0.92
+yaw_gimbal_antiwindup_min_gain = 0.10
+yaw_input_gain_mode = "flat"
+yaw_adaptive_slow_gain = 0.65
+yaw_adaptive_fast_gain = 1.60
+yaw_adaptive_speed_low = 120.0
+yaw_adaptive_speed_high = 1800.0
+yaw_adaptive_curve = 1.0
+yaw_adaptive_tracker_ms = 35.0
+yaw_gate_shape = "axis"
+yaw_diagonal_scale = 1.0
+yaw_output_shaping_enabled = false
+yaw_return_shaping_enabled = false
+yaw_output_shape_nodes = []
+yaw_return_shape_nodes = []
+[safety]
+stop_key = "F1"
+freeze_key = "F3"
+
+[control]
+mode = "direct_mouse"

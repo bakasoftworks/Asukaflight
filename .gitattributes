@@ -1,0 +1,18 @@
+* text=auto
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+*.png binary
+*.ico binary
+*.gif binary
+*.jpg binary
+*.jpeg binary
+*.bmp binary
+*.otf binary
+*.ttf binary
+*.woff binary
+*.pack binary
+*.zip binary
+*.bin binary
+*.BIN binary
+*.uf2 binary
+*.UF2 binary
