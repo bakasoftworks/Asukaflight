@@ -58,8 +58,6 @@ packages.
 
 ## User Directions
 
-First, download and extract the latest release from the "Releases" section on the right.
-
 To set up a Radiomaster GX12 model for Asukaflight, first download the latest .zip from the Releases section and extract. Then:
 
 1. Power on the radio in bootloader mode by holding the horizontal trim buttons
