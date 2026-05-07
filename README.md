@@ -20,8 +20,11 @@ simulators such as VelociDrone.
 
 Support is eventually planned for USB joysticks and other radios, especially
 the TX16S family. Current packages may include experimental TX16S firmware
-candidates, but they are untested, not guaranteed, and separate from the
-validated GX12 firmware. To discuss hardware support and/or send a radio to the
+candidates, but they are untested and separate from the
+validated GX12 firmware. Flash at your own peril, although they shouldn't
+cause any issues beyond potentially not working with Asukaflight,
+and from what I've read, DFU radios can always be recovered if something goes wrong.
+To discuss hardware support and/or send a radio to the
 developer's PO box, contact `arconautics@gmail.com`.
 
 Asukaflight supports mice and other USB devices with polling rates up to
