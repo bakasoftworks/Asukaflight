@@ -230,6 +230,7 @@ public sealed class ProfileRepository
             var keyboardEnabled = document.GetBool("keyboard_left_stick", "enabled", false);
             var keyboardInputSource = document.GetString("keyboard_left_stick", "input_source", "gameinput");
             var mouseLeftEnabled = document.GetBool("mouse_left_stick", "enabled", false);
+            var rightMouseLeftEnabled = document.GetBool("right_mouse_left_stick", "enabled", false);
             var outputShaping = document.GetBool("mapper", "output_shaping_enabled", false);
             var returnShaping = document.GetBool("mapper", "return_shaping_enabled", false);
             var outputCurve = document.GetString("mapper", "output_curve", outputShaping ? "nodes" : "expo");
@@ -252,6 +253,7 @@ public sealed class ProfileRepository
                 keyboardEnabled,
                 keyboardInputSource,
                 mouseLeftEnabled,
+                rightMouseLeftEnabled,
                 outputShaping,
                 returnShaping,
                 mouseLeftYawShaping,
@@ -293,6 +295,7 @@ public sealed class ProfileRepository
                 MouseRightEnabled = mouseRightEnabled,
                 KeyboardEnabled = keyboardEnabled,
                 MouseLeftEnabled = mouseLeftEnabled,
+                RightMouseLeftEnabled = rightMouseLeftEnabled,
                 OutputShapingEnabled = outputShaping,
                 ReturnShapingEnabled = returnShaping,
                 MouseLeftYawShapingEnabled = mouseLeftYawShaping,
@@ -322,7 +325,7 @@ public sealed class ProfileRepository
                 LeftDevice = "",
                 KeyboardInputSource = "",
                 LastWriteTime = fileInfo.LastWriteTime,
-                Badges = BuildBadges(isDefault, "", false, false, "", false, false, false, false, "", true),
+                Badges = BuildBadges(isDefault, "", false, false, "", false, false, false, false, false, "", true),
                 LoadError = exception.Message
             };
         }
@@ -335,6 +338,7 @@ public sealed class ProfileRepository
         bool keyboardEnabled,
         string keyboardInputSource,
         bool mouseLeftEnabled,
+        bool rightMouseLeftEnabled,
         bool outputShaping,
         bool returnShaping,
         bool mouseLeftYawShaping,
@@ -380,6 +384,11 @@ public sealed class ProfileRepository
         if (mouseLeftEnabled)
         {
             badges.Add(new ProfileBadge("Second mouse", "Neutral"));
+        }
+
+        if (rightMouseLeftEnabled)
+        {
+            badges.Add(new ProfileBadge("Right buttons", "Neutral"));
         }
 
         if (resolutionMode.Equals("gx12_2x", StringComparison.OrdinalIgnoreCase))

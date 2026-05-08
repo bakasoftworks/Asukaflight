@@ -821,6 +821,7 @@
                                             <ComboBoxItem Content="Off" />
                                             <ComboBoxItem Content="Keyboard / Wooting" />
                                             <ComboBoxItem Content="Second mouse" />
+                                            <ComboBoxItem Content="Right Mouse Mouse4/Mouse5 + Scroll" />
                                         </ComboBox>
                                     </Grid>
 
@@ -877,6 +878,40 @@
                                         <CheckBox Content="Invert throttle" IsChecked="{Binding Editor.MouseLeftInvertThrottle, Mode=TwoWay}" Style="{StaticResource EditorCheckBoxStyle}" />
                                         <CheckBox Content="Invert yaw" IsChecked="{Binding Editor.MouseLeftInvertYaw, Mode=TwoWay}" Style="{StaticResource EditorCheckBoxStyle}" />
                                         <CheckBox Content="Swap axes" IsChecked="{Binding Editor.MouseLeftSwapAxes, Mode=TwoWay}" Style="{StaticResource EditorCheckBoxStyle}" />
+                                    </WrapPanel>
+
+                                    <Grid Visibility="{Binding Editor.IsRightMouseLeftSelected, Converter={StaticResource BooleanToVisibilityConverter}}">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="110" />
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="110" />
+                                            <ColumnDefinition Width="*" />
+                                        </Grid.ColumnDefinitions>
+                                        <Grid.RowDefinitions>
+                                            <RowDefinition Height="Auto" />
+                                            <RowDefinition Height="Auto" />
+                                            <RowDefinition Height="Auto" />
+                                        </Grid.RowDefinitions>
+
+                                        <TextBlock Grid.Row="0" Grid.Column="0" Text="Throttle step" Style="{StaticResource FieldLabelStyle}" />
+                                        <TextBox Grid.Row="0" Grid.Column="1" Text="{Binding Editor.RightMouseLeftThrottleStep, UpdateSourceTrigger=LostFocus}" Style="{StaticResource EditorTextBoxStyle}" />
+                                        <TextBlock Grid.Row="0" Grid.Column="2" Text="Button rate" Style="{StaticResource FieldLabelStyle}" />
+                                        <TextBox Grid.Row="0" Grid.Column="3" Text="{Binding Editor.RightMouseLeftThrottleButtonRate, UpdateSourceTrigger=LostFocus}" Style="{StaticResource EditorTextBoxStyle}" />
+                                        <TextBlock Grid.Row="1" Grid.Column="0" Text="Yaw max" Style="{StaticResource FieldLabelStyle}" />
+                                        <TextBox Grid.Row="1" Grid.Column="1" Text="{Binding Editor.RightMouseLeftYawPulse, UpdateSourceTrigger=LostFocus}" Style="{StaticResource EditorTextBoxStyle}" />
+                                        <TextBlock Grid.Row="1" Grid.Column="2" Text="Yaw step" Style="{StaticResource FieldLabelStyle}" />
+                                        <TextBox Grid.Row="1" Grid.Column="3" Text="{Binding Editor.RightMouseLeftYawScrollStep, UpdateSourceTrigger=LostFocus}" Style="{StaticResource EditorTextBoxStyle}" />
+                                        <TextBlock Grid.Row="2" Grid.Column="0" Text="Yaw slew" Style="{StaticResource FieldLabelStyle}" />
+                                        <TextBox Grid.Row="2" Grid.Column="1" Text="{Binding Editor.RightMouseLeftYawSlewRate, UpdateSourceTrigger=LostFocus}" Style="{StaticResource EditorTextBoxStyle}" />
+                                        <TextBlock Grid.Row="2" Grid.Column="2" Text="Return" Style="{StaticResource FieldLabelStyle}" />
+                                        <TextBox Grid.Row="2" Grid.Column="3" Text="{Binding Editor.RightMouseLeftThrottleReturnRate, UpdateSourceTrigger=LostFocus}" Style="{StaticResource EditorTextBoxStyle}" />
+                                    </Grid>
+
+                                    <WrapPanel Visibility="{Binding Editor.IsRightMouseLeftSelected, Converter={StaticResource BooleanToVisibilityConverter}}" Margin="0,4,0,0">
+                                        <CheckBox Content="Throttle return" IsChecked="{Binding Editor.RightMouseLeftThrottleReturnEnabled, Mode=TwoWay}" Style="{StaticResource EditorCheckBoxStyle}" />
+                                        <CheckBox Content="Invert throttle" IsChecked="{Binding Editor.RightMouseLeftInvertThrottle, Mode=TwoWay}" Style="{StaticResource EditorCheckBoxStyle}" />
+                                        <CheckBox Content="Invert yaw" IsChecked="{Binding Editor.RightMouseLeftInvertYaw, Mode=TwoWay}" Style="{StaticResource EditorCheckBoxStyle}" />
+                                        <CheckBox Content="Swap buttons/scroll" IsChecked="{Binding Editor.RightMouseLeftSwapAxes, Mode=TwoWay}" Style="{StaticResource EditorCheckBoxStyle}" />
                                     </WrapPanel>
                                 </StackPanel>
                             </Border>

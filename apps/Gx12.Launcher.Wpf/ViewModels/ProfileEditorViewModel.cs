@@ -20,6 +20,7 @@ public sealed class ProfileEditorViewModel : ObservableObject
     public const string LeftSourceOff = "Off";
     public const string LeftSourceKeyboard = "Keyboard / Wooting";
     public const string LeftSourceMouse = "Second mouse";
+    public const string LeftSourceRightMouseButtonsScroll = "Right Mouse Mouse4/Mouse5 + Scroll";
 
     private readonly ProfileRepository _repository;
     private readonly Gx12DiagnosticsService _diagnosticsService;
@@ -100,6 +101,16 @@ public sealed class ProfileEditorViewModel : ObservableObject
     private bool _mouseLeftInvertThrottle;
     private bool _mouseLeftInvertYaw;
     private bool _mouseLeftSwapAxes;
+    private string _rightMouseLeftThrottleStep = "";
+    private string _rightMouseLeftThrottleButtonRate = "";
+    private string _rightMouseLeftYawPulse = "";
+    private string _rightMouseLeftYawScrollStep = "";
+    private string _rightMouseLeftYawSlewRate = "";
+    private bool _rightMouseLeftThrottleReturnEnabled;
+    private string _rightMouseLeftThrottleReturnRate = "";
+    private bool _rightMouseLeftInvertThrottle;
+    private bool _rightMouseLeftInvertYaw;
+    private bool _rightMouseLeftSwapAxes;
     private bool _mouseLeftYawShapingEnabled;
     private string _mouseLeftYawOutputCurve = "expo";
     private bool _mouseLeftYawOutputShapingEnabled;
@@ -277,6 +288,10 @@ public sealed class ProfileEditorViewModel : ObservableObject
     public bool IsMouseLeftSelected =>
         IsDirectMouseMode &&
         LeftStickSource.Equals(LeftSourceMouse, StringComparison.Ordinal);
+
+    public bool IsRightMouseLeftSelected =>
+        IsDirectMouseMode &&
+        LeftStickSource.Equals(LeftSourceRightMouseButtonsScroll, StringComparison.Ordinal);
 
     public bool IsOutputShapeActive =>
         IsDirectMouseMode &&
@@ -1196,6 +1211,66 @@ public sealed class ProfileEditorViewModel : ObservableObject
         set => SetBoolValue(ref _mouseLeftSwapAxes, value, "mouse_left_stick", "swap_axes");
     }
 
+    public string RightMouseLeftThrottleStep
+    {
+        get => _rightMouseLeftThrottleStep;
+        set => SetRawValue(ref _rightMouseLeftThrottleStep, value, "right_mouse_left_stick", "throttle_step");
+    }
+
+    public string RightMouseLeftThrottleButtonRate
+    {
+        get => _rightMouseLeftThrottleButtonRate;
+        set => SetRawValue(ref _rightMouseLeftThrottleButtonRate, value, "right_mouse_left_stick", "throttle_button_rate");
+    }
+
+    public string RightMouseLeftYawPulse
+    {
+        get => _rightMouseLeftYawPulse;
+        set => SetRawValue(ref _rightMouseLeftYawPulse, value, "right_mouse_left_stick", "yaw_pulse");
+    }
+
+    public string RightMouseLeftYawScrollStep
+    {
+        get => _rightMouseLeftYawScrollStep;
+        set => SetRawValue(ref _rightMouseLeftYawScrollStep, value, "right_mouse_left_stick", "yaw_scroll_step");
+    }
+
+    public string RightMouseLeftYawSlewRate
+    {
+        get => _rightMouseLeftYawSlewRate;
+        set => SetRawValue(ref _rightMouseLeftYawSlewRate, value, "right_mouse_left_stick", "yaw_slew_rate");
+    }
+
+    public bool RightMouseLeftThrottleReturnEnabled
+    {
+        get => _rightMouseLeftThrottleReturnEnabled;
+        set => SetBoolValue(ref _rightMouseLeftThrottleReturnEnabled, value, "right_mouse_left_stick", "throttle_return_enabled");
+    }
+
+    public string RightMouseLeftThrottleReturnRate
+    {
+        get => _rightMouseLeftThrottleReturnRate;
+        set => SetRawValue(ref _rightMouseLeftThrottleReturnRate, value, "right_mouse_left_stick", "throttle_return_rate");
+    }
+
+    public bool RightMouseLeftInvertThrottle
+    {
+        get => _rightMouseLeftInvertThrottle;
+        set => SetBoolValue(ref _rightMouseLeftInvertThrottle, value, "right_mouse_left_stick", "invert_throttle");
+    }
+
+    public bool RightMouseLeftInvertYaw
+    {
+        get => _rightMouseLeftInvertYaw;
+        set => SetBoolValue(ref _rightMouseLeftInvertYaw, value, "right_mouse_left_stick", "invert_yaw");
+    }
+
+    public bool RightMouseLeftSwapAxes
+    {
+        get => _rightMouseLeftSwapAxes;
+        set => SetBoolValue(ref _rightMouseLeftSwapAxes, value, "right_mouse_left_stick", "swap_axes");
+    }
+
     public bool MouseLeftYawShapingEnabled
     {
         get => _mouseLeftYawShapingEnabled;
@@ -1402,11 +1477,14 @@ public sealed class ProfileEditorViewModel : ObservableObject
 
             var keyboardEnabled = document.GetBool("keyboard_left_stick", "enabled", false);
             var mouseLeftEnabled = document.GetBool("mouse_left_stick", "enabled", false);
-            LeftStickSource = mouseLeftEnabled
-                ? LeftSourceMouse
-                : keyboardEnabled
-                    ? LeftSourceKeyboard
-                    : LeftSourceOff;
+            var rightMouseLeftEnabled = document.GetBool("right_mouse_left_stick", "enabled", false);
+            LeftStickSource = rightMouseLeftEnabled
+                ? LeftSourceRightMouseButtonsScroll
+                : mouseLeftEnabled
+                    ? LeftSourceMouse
+                    : keyboardEnabled
+                        ? LeftSourceKeyboard
+                        : LeftSourceOff;
 
             KeyboardInputSource = document.GetString("keyboard_left_stick", "input_source", "gameinput");
             KeyboardRequireAnalog = document.GetBool("keyboard_left_stick", "require_analog", false);
@@ -1418,6 +1496,16 @@ public sealed class ProfileEditorViewModel : ObservableObject
             MouseLeftInvertThrottle = document.GetBool("mouse_left_stick", "invert_throttle", false);
             MouseLeftInvertYaw = document.GetBool("mouse_left_stick", "invert_yaw", false);
             MouseLeftSwapAxes = document.GetBool("mouse_left_stick", "swap_axes", false);
+            RightMouseLeftThrottleStep = document.GetRaw("right_mouse_left_stick", "throttle_step", "64.0");
+            RightMouseLeftThrottleButtonRate = document.GetRaw("right_mouse_left_stick", "throttle_button_rate", "4096.0");
+            RightMouseLeftYawPulse = document.GetRaw("right_mouse_left_stick", "yaw_pulse", "512");
+            RightMouseLeftYawScrollStep = document.GetRaw("right_mouse_left_stick", "yaw_scroll_step", "64.0");
+            RightMouseLeftYawSlewRate = document.GetRaw("right_mouse_left_stick", "yaw_slew_rate", "4096.0");
+            RightMouseLeftThrottleReturnEnabled = document.GetBool("right_mouse_left_stick", "throttle_return_enabled", false);
+            RightMouseLeftThrottleReturnRate = document.GetRaw("right_mouse_left_stick", "throttle_return_rate", "0.0");
+            RightMouseLeftInvertThrottle = document.GetBool("right_mouse_left_stick", "invert_throttle", false);
+            RightMouseLeftInvertYaw = document.GetBool("right_mouse_left_stick", "invert_yaw", false);
+            RightMouseLeftSwapAxes = document.GetBool("right_mouse_left_stick", "swap_axes", false);
             MouseLeftYawShapingEnabled = document.GetBool(
                 "mouse_left_stick",
                 "yaw_shaping_enabled",
@@ -1649,7 +1737,8 @@ public sealed class ProfileEditorViewModel : ObservableObject
             {
                 new ProfileValueUpdate("control", "mode", TomlProfileDocument.QuoteString(normalized)),
                 new ProfileValueUpdate("keyboard_left_stick", "enabled", "false"),
-                new ProfileValueUpdate("mouse_left_stick", "enabled", "false")
+                new ProfileValueUpdate("mouse_left_stick", "enabled", "false"),
+                new ProfileValueUpdate("right_mouse_left_stick", "enabled", "false")
             });
             return;
         }
@@ -1673,7 +1762,9 @@ public sealed class ProfileEditorViewModel : ObservableObject
         }
 
         var updates = new List<ProfileValueUpdate>();
-        if (normalized.Equals(LeftSourceMouse, StringComparison.Ordinal) && IsMouseAimMode)
+        if ((normalized.Equals(LeftSourceMouse, StringComparison.Ordinal) ||
+             normalized.Equals(LeftSourceRightMouseButtonsScroll, StringComparison.Ordinal)) &&
+            IsMouseAimMode)
         {
             _controlMode = "direct_mouse";
             OnPropertyChanged(nameof(ControlMode));
@@ -1689,6 +1780,10 @@ public sealed class ProfileEditorViewModel : ObservableObject
             "mouse_left_stick",
             "enabled",
             normalized.Equals(LeftSourceMouse, StringComparison.Ordinal) ? "true" : "false"));
+        updates.Add(new ProfileValueUpdate(
+            "right_mouse_left_stick",
+            "enabled",
+            normalized.Equals(LeftSourceRightMouseButtonsScroll, StringComparison.Ordinal) ? "true" : "false"));
 
         SaveMany(updates);
     }
@@ -1739,6 +1834,7 @@ public sealed class ProfileEditorViewModel : ObservableObject
         OnPropertyChanged(nameof(MouseAimEnabled));
         OnPropertyChanged(nameof(IsKeyboardLeftSelected));
         OnPropertyChanged(nameof(IsMouseLeftSelected));
+        OnPropertyChanged(nameof(IsRightMouseLeftSelected));
         OnShapePropertiesChanged();
         OnMouseLeftYawShapePropertiesChanged();
     }
@@ -1747,6 +1843,7 @@ public sealed class ProfileEditorViewModel : ObservableObject
     {
         OnPropertyChanged(nameof(IsKeyboardLeftSelected));
         OnPropertyChanged(nameof(IsMouseLeftSelected));
+        OnPropertyChanged(nameof(IsRightMouseLeftSelected));
         OnMouseLeftYawShapePropertiesChanged();
     }
 
@@ -2500,6 +2597,39 @@ public sealed class ProfileEditorViewModel : ObservableObject
                     break;
                 case "mouse_left_stick.yaw_return_shape_nodes":
                     MouseLeftYawReturnShapeNodesText = editValue;
+                    break;
+                case "right_mouse_left_stick.enabled":
+                    LeftStickSource = ParseCatalogBool(editValue) ? LeftSourceRightMouseButtonsScroll : LeftSourceOff;
+                    break;
+                case "right_mouse_left_stick.throttle_step":
+                    RightMouseLeftThrottleStep = editValue;
+                    break;
+                case "right_mouse_left_stick.throttle_button_rate":
+                    RightMouseLeftThrottleButtonRate = editValue;
+                    break;
+                case "right_mouse_left_stick.throttle_return_enabled":
+                    RightMouseLeftThrottleReturnEnabled = ParseCatalogBool(editValue);
+                    break;
+                case "right_mouse_left_stick.throttle_return_rate":
+                    RightMouseLeftThrottleReturnRate = editValue;
+                    break;
+                case "right_mouse_left_stick.yaw_pulse":
+                    RightMouseLeftYawPulse = editValue;
+                    break;
+                case "right_mouse_left_stick.yaw_scroll_step":
+                    RightMouseLeftYawScrollStep = editValue;
+                    break;
+                case "right_mouse_left_stick.yaw_slew_rate":
+                    RightMouseLeftYawSlewRate = editValue;
+                    break;
+                case "right_mouse_left_stick.invert_throttle":
+                    RightMouseLeftInvertThrottle = ParseCatalogBool(editValue);
+                    break;
+                case "right_mouse_left_stick.invert_yaw":
+                    RightMouseLeftInvertYaw = ParseCatalogBool(editValue);
+                    break;
+                case "right_mouse_left_stick.swap_axes":
+                    RightMouseLeftSwapAxes = ParseCatalogBool(editValue);
                     break;
                 case "mouse_aim.sensitivity_x":
                     AimSensitivityX = editValue;

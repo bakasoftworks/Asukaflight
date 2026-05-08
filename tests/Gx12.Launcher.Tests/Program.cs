@@ -218,14 +218,20 @@ static void BatchSaveSwitchesLeftStickSources()
         "enabled = true\r\n" +
         "\r\n" +
         "[mouse_left_stick]\r\n" +
+        "enabled = false\r\n" +
+        "\r\n" +
+        "[right_mouse_left_stick]\r\n" +
         "enabled = false\r\n";
     File.WriteAllText(profilePath, original);
 
     var validator = new DelegateProfileValidator((_, path) =>
     {
         var document = TomlProfileDocument.Load(path);
-        return document.GetBool("keyboard_left_stick", "enabled") &&
-               document.GetBool("mouse_left_stick", "enabled")
+        var enabledCount =
+            (document.GetBool("keyboard_left_stick", "enabled") ? 1 : 0) +
+            (document.GetBool("mouse_left_stick", "enabled") ? 1 : 0) +
+            (document.GetBool("right_mouse_left_stick", "enabled") ? 1 : 0);
+        return enabledCount > 1
             ? ProfileValidationResult.Failure("left-stick sources conflict")
             : ProfileValidationResult.Success();
     });
@@ -245,6 +251,19 @@ static void BatchSaveSwitchesLeftStickSources()
     var saved = TomlProfileDocument.Load(profilePath);
     AssertTrue(!saved.GetBool("keyboard_left_stick", "enabled"), "Keyboard source should be disabled.");
     AssertTrue(saved.GetBool("mouse_left_stick", "enabled"), "Second mouse source should be enabled.");
+    AssertTrue(!saved.GetBool("right_mouse_left_stick", "enabled"), "Right-mouse button/scroll source should be disabled.");
+
+    var savedRightMouse = repository.SaveProfileValues(profilePath, new[]
+    {
+        new ProfileValueUpdate("mouse_left_stick", "enabled", "false"),
+        new ProfileValueUpdate("right_mouse_left_stick", "enabled", "true")
+    });
+    AssertTrue(savedRightMouse.IsSuccess && savedRightMouse.Changed, "Batch switch to right mouse buttons/scroll should save.");
+
+    saved = TomlProfileDocument.Load(profilePath);
+    AssertTrue(!saved.GetBool("keyboard_left_stick", "enabled"), "Keyboard source should stay disabled.");
+    AssertTrue(!saved.GetBool("mouse_left_stick", "enabled"), "Second mouse source should be disabled.");
+    AssertTrue(saved.GetBool("right_mouse_left_stick", "enabled"), "Right-mouse button/scroll source should be enabled.");
 }
 
 static void SettingsSchemaCoversV3AndProfiles()
@@ -517,10 +536,15 @@ static void ProfileEditorOptionVisibilityFollowsSelectedModes()
     AssertTrue(editor.IsMouseLeftYawOutputShapeActive, "Left-yaw output graph should require yaw shaping and nodes.");
     AssertTrue(editor.IsMouseLeftYawReturnShapeActive, "Left-yaw return graph should require yaw shaping and return nodes.");
 
+    editor.LeftStickSource = ProfileEditorViewModel.LeftSourceRightMouseButtonsScroll;
+    AssertTrue(editor.IsRightMouseLeftSelected, "Right-mouse button/scroll parameters should show for that source.");
+    AssertTrue(!editor.IsMouseLeftSelected, "Second-mouse parameters should hide for the right-mouse button/scroll source.");
+
     editor.ControlMode = "drone_mouse_aim";
     AssertTrue(editor.MouseAimEnabled, "Reticle-aim toggle should reflect reticle-aim mode.");
     AssertTrue(!editor.IsRightStickBasicActive, "Direct right-stick parameters should hide in reticle-aim mode.");
     AssertTrue(!editor.IsMouseLeftSelected, "Second-mouse parameters should hide in reticle-aim mode.");
+    AssertTrue(!editor.IsRightMouseLeftSelected, "Right-mouse button/scroll parameters should hide in reticle-aim mode.");
 
     editor.MouseAimEnabled = false;
     AssertEqual("direct_mouse", editor.ControlMode, "Reticle-aim toggle should switch the profile back to direct mouse.");
@@ -531,6 +555,7 @@ static void ProfileEditorOptionVisibilityFollowsSelectedModes()
     var saved = TomlProfileDocument.Load(profilePath);
     AssertEqual("drone_mouse_aim", saved.GetString("control", "mode", ""), "Reticle-aim toggle should save control.mode.");
     AssertTrue(!saved.GetBool("mouse_left_stick", "enabled", true), "Reticle-aim toggle should disable the second-mouse left-stick source.");
+    AssertTrue(!saved.GetBool("right_mouse_left_stick", "enabled", true), "Reticle-aim toggle should disable the right-mouse button/scroll left-stick source.");
 }
 
 static void StickShapeNodesParseClampAndFormat()

@@ -54,7 +54,8 @@ result over the composite CDC port while VelociDrone keeps foreground and reads
 the GX12 HID joystick.
 
 Left-stick trainer channels can come from digital GameInput keys, the Wooting
-Analog SDK, or a second GameInput mouse. Wooting support is
+Analog SDK, a second GameInput mouse, or the right mouse side buttons plus
+vertical scroll wheel. Wooting support is
 runtime-loaded so `gx12mouse.exe` still starts on machines without the SDK. In
 Wootility, use no gamepad output for this project so VelociDrone sees only
 `Radiomaster GX12 Joystick`. The second-mouse path uses GameInput per-device

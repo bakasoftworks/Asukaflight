@@ -156,6 +156,18 @@ yaw_output_shaping_enabled = false
 yaw_return_shaping_enabled = false
 yaw_output_shape_nodes = []
 yaw_return_shape_nodes = []
+[right_mouse_left_stick]
+enabled = false
+throttle_step = 64.0
+throttle_button_rate = 4096.0
+throttle_return_enabled = false
+throttle_return_rate = 0.0
+yaw_pulse = 512
+yaw_scroll_step = 64.0
+yaw_slew_rate = 4096.0
+invert_throttle = false
+invert_yaw = false
+swap_axes = false
 [safety]
 stop_key = "F1"
 freeze_key = "F3"

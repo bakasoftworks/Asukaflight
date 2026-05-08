@@ -1072,6 +1072,8 @@ struct GameInputMouseRoleCounters {
     std::atomic<uint64_t> errors{0};
     std::atomic<int64_t> dx_sum{0};
     std::atomic<int64_t> dy_sum{0};
+    std::atomic<int64_t> wheel_x_sum{0};
+    std::atomic<int64_t> wheel_y_sum{0};
     std::atomic<uint32_t> buttons{0};
 };
 
@@ -1081,6 +1083,8 @@ struct GameInputMouseRoleSnapshot {
     uint64_t errors = 0;
     int64_t dx_sum = 0;
     int64_t dy_sum = 0;
+    int64_t wheel_x_sum = 0;
+    int64_t wheel_y_sum = 0;
     uint32_t buttons = 0;
 };
 
@@ -1091,13 +1095,33 @@ GameInputMouseRoleSnapshot SnapshotGameInputRole(const GameInputMouseRoleCounter
     out.errors = stats.errors.load(std::memory_order_acquire);
     out.dx_sum = stats.dx_sum.load(std::memory_order_acquire);
     out.dy_sum = stats.dy_sum.load(std::memory_order_acquire);
+    out.wheel_x_sum = stats.wheel_x_sum.load(std::memory_order_acquire);
+    out.wheel_y_sum = stats.wheel_y_sum.load(std::memory_order_acquire);
     out.buttons = stats.buttons.load(std::memory_order_acquire);
     return out;
+}
+
+double NormalizeGameInputWheelDelta(int64_t wheel_delta) {
+    constexpr double kWheelDetent = 120.0;
+    if (std::abs(wheel_delta) >= static_cast<int64_t>(kWheelDetent)) {
+        return static_cast<double>(wheel_delta) / kWheelDetent;
+    }
+    return static_cast<double>(wheel_delta);
+}
+
+int GameInputMouse4Mouse5Axis(uint32_t buttons) {
+    constexpr uint32_t kMouse4 = static_cast<uint32_t>(gi::GameInputMouseButton4);
+    constexpr uint32_t kMouse5 = static_cast<uint32_t>(gi::GameInputMouseButton5);
+    const int mouse4 = (buttons & kMouse4) != 0 ? 1 : 0;
+    const int mouse5 = (buttons & kMouse5) != 0 ? 1 : 0;
+    return mouse5 - mouse4;
 }
 
 void AddGameInputRoleDelta(GameInputMouseRoleCounters* role,
                            int64_t dx,
                            int64_t dy,
+                           int64_t wheel_x,
+                           int64_t wheel_y,
                            uint32_t buttons) {
     if (!role) {
         return;
@@ -1106,6 +1130,8 @@ void AddGameInputRoleDelta(GameInputMouseRoleCounters* role,
     role->mouse_states.fetch_add(1, std::memory_order_relaxed);
     role->dx_sum.fetch_add(dx, std::memory_order_relaxed);
     role->dy_sum.fetch_add(dy, std::memory_order_relaxed);
+    role->wheel_x_sum.fetch_add(wheel_x, std::memory_order_relaxed);
+    role->wheel_y_sum.fetch_add(wheel_y, std::memory_order_relaxed);
     role->buttons.store(buttons, std::memory_order_release);
 }
 
@@ -1131,6 +1157,8 @@ struct GameInputMouseRateStats {
         std::string token;
         int64_t x = 0;
         int64_t y = 0;
+        int64_t wheel_x = 0;
+        int64_t wheel_y = 0;
         bool have = false;
     };
     std::mutex previous_mutex;
@@ -1212,6 +1240,8 @@ void CALLBACK GameInputMouseReadingCallback(gi::GameInputCallbackToken,
     const std::string token = GameInputReadingDeviceToken(reading);
     int64_t dx = 0;
     int64_t dy = 0;
+    int64_t wheel_x = 0;
+    int64_t wheel_y = 0;
     bool have_delta = false;
     {
         std::lock_guard<std::mutex> lock(stats->previous_mutex);
@@ -1225,38 +1255,55 @@ void CALLBACK GameInputMouseReadingCallback(gi::GameInputCallbackToken,
             item.token = token;
             item.x = mouse.positionX;
             item.y = mouse.positionY;
+            item.wheel_x = mouse.wheelX;
+            item.wheel_y = mouse.wheelY;
             item.have = true;
             stats->previous_by_device.push_back(item);
         } else {
             if (it->have) {
                 dx = mouse.positionX - it->x;
                 dy = mouse.positionY - it->y;
+                wheel_x = mouse.wheelX - it->wheel_x;
+                wheel_y = mouse.wheelY - it->wheel_y;
                 have_delta = true;
             }
             it->x = mouse.positionX;
             it->y = mouse.positionY;
+            it->wheel_x = mouse.wheelX;
+            it->wheel_y = mouse.wheelY;
             it->have = true;
         }
     }
     stats->last_x.store(mouse.positionX, std::memory_order_release);
     stats->last_y.store(mouse.positionY, std::memory_order_release);
-    if (stats->have_previous.exchange(true, std::memory_order_acq_rel) && have_delta) {
+    const bool had_previous = stats->have_previous.exchange(true, std::memory_order_acq_rel);
+    bool right_match = GameInputTokenMatches(stats->right_device_token, token);
+    const bool left_match = GameInputMouseLeftRoleMatches(stats, token, right_match);
+    if (right_match &&
+        MouseDeviceTokenBindingIsAuto(stats->right_device_token) &&
+        !stats->left_device_token.empty() &&
+        left_match) {
+        right_match = false;
+    }
+    if (had_previous && have_delta) {
         stats->dx_sum.fetch_add(dx, std::memory_order_relaxed);
         stats->dy_sum.fetch_add(dy, std::memory_order_relaxed);
-        bool right_match = GameInputTokenMatches(stats->right_device_token, token);
-        const bool left_match = GameInputMouseLeftRoleMatches(stats, token, right_match);
-        if (right_match &&
-            MouseDeviceTokenBindingIsAuto(stats->right_device_token) &&
-            !stats->left_device_token.empty() &&
-            left_match) {
-            right_match = false;
-        }
-        if (right_match) {
-            AddGameInputRoleDelta(&stats->right_mouse, dx, dy, static_cast<uint32_t>(mouse.buttons));
-        }
-        if (left_match) {
-            AddGameInputRoleDelta(&stats->left_mouse, dx, dy, static_cast<uint32_t>(mouse.buttons));
-        }
+    }
+    if (right_match) {
+        AddGameInputRoleDelta(&stats->right_mouse,
+                              had_previous && have_delta ? dx : 0,
+                              had_previous && have_delta ? dy : 0,
+                              had_previous && have_delta ? wheel_x : 0,
+                              had_previous && have_delta ? wheel_y : 0,
+                              static_cast<uint32_t>(mouse.buttons));
+    }
+    if (left_match) {
+        AddGameInputRoleDelta(&stats->left_mouse,
+                              had_previous && have_delta ? dx : 0,
+                              had_previous && have_delta ? dy : 0,
+                              had_previous && have_delta ? wheel_x : 0,
+                              had_previous && have_delta ? wheel_y : 0,
+                              static_cast<uint32_t>(mouse.buttons));
     }
 }
 
@@ -2451,6 +2498,20 @@ struct MouseLeftStickProfile {
     StickShapeCurve yaw_return_shape;
 };
 
+struct RightMouseLeftStickProfile {
+    bool enabled = false;
+    bool invert_throttle = false;
+    bool invert_yaw = false;
+    bool swap_axes = false;
+    double throttle_step = 64.0;
+    double throttle_button_rate = 4096.0;
+    bool throttle_return_enabled = false;
+    double throttle_return_rate = 0.0;
+    int yaw_pulse = 512;
+    double yaw_scroll_step = 64.0;
+    double yaw_slew_rate = 4096.0;
+};
+
 const char* KeyboardInputSourceName(KeyboardLeftStickProfile::InputSource source) {
     switch (source) {
     case KeyboardLeftStickProfile::InputSource::GameInput:
@@ -3261,6 +3322,7 @@ struct TrainerProfile {
     std::string mouse_right_device_token = "auto";
     std::string mouse_left_device_token;
     MouseLeftStickProfile mouse_left;
+    RightMouseLeftStickProfile right_mouse_left;
     KeyboardLeftStickProfile keyboard_left;
     bool log_csv = false;
     std::string log_path = "logs\\trainer-profile.csv";
@@ -4907,6 +4969,59 @@ bool ValidateTrainerProfile(const TrainerProfile& profile) {
             return false;
         }
     }
+    if (profile.right_mouse_left.enabled) {
+        if (profile.keyboard_left.enabled || profile.mouse_left.enabled) {
+            std::fprintf(stderr,
+                         "profile error: right_mouse_left_stick.enabled is mutually exclusive with keyboard_left_stick.enabled and mouse_left_stick.enabled.\n");
+            return false;
+        }
+        if (profile.control_mode != ControlMode::DirectMouse) {
+            std::fprintf(stderr,
+                         "profile error: right_mouse_left_stick currently requires control.mode=\"direct_mouse\".\n");
+            return false;
+        }
+        if (!profile.mouse_right_stick_enabled) {
+            std::fprintf(stderr,
+                         "profile error: right_mouse_left_stick requires mouse_right_stick.enabled=true.\n");
+            return false;
+        }
+        if (profile.right_mouse_left.throttle_step < 0.0 ||
+            profile.right_mouse_left.throttle_step > 1024.0) {
+            std::fprintf(stderr,
+                         "profile error: right_mouse_left_stick.throttle_step must be 0..1024 trainer units per wheel notch.\n");
+            return false;
+        }
+        if (profile.right_mouse_left.throttle_button_rate < 0.0 ||
+            profile.right_mouse_left.throttle_button_rate > 10000.0) {
+            std::fprintf(stderr,
+                         "profile error: right_mouse_left_stick.throttle_button_rate must be 0..10000 trainer units per second.\n");
+            return false;
+        }
+        if (profile.right_mouse_left.throttle_return_rate < 0.0 ||
+            profile.right_mouse_left.throttle_return_rate > 20000.0) {
+            std::fprintf(stderr,
+                         "profile error: right_mouse_left_stick.throttle_return_rate must be 0..20000 trainer units per second.\n");
+            return false;
+        }
+        if (profile.right_mouse_left.yaw_pulse < 0 ||
+            profile.right_mouse_left.yaw_pulse > 512) {
+            std::fprintf(stderr,
+                         "profile error: right_mouse_left_stick.yaw_pulse must be 0..512.\n");
+            return false;
+        }
+        if (profile.right_mouse_left.yaw_scroll_step < 0.0 ||
+            profile.right_mouse_left.yaw_scroll_step > 1024.0) {
+            std::fprintf(stderr,
+                         "profile error: right_mouse_left_stick.yaw_scroll_step must be 0..1024 trainer units per wheel notch.\n");
+            return false;
+        }
+        if (profile.right_mouse_left.yaw_slew_rate < 0.0 ||
+            profile.right_mouse_left.yaw_slew_rate > 20000.0) {
+            std::fprintf(stderr,
+                         "profile error: right_mouse_left_stick.yaw_slew_rate must be 0..20000 trainer units per second.\n");
+            return false;
+        }
+    }
     if (profile.keyboard_left.enabled) {
         WootingAnalogKeycodeMode analog_mode;
         if (!ParseWootingAnalogKeycodeMode(profile.keyboard_left.analog_keycode_mode, &analog_mode)) {
@@ -4979,6 +5094,7 @@ uint8_t TrainerActiveFlags(const TrainerProfile& profile) {
         flags |= kSbusTrainerMaskRightActive;
     }
     if (profile.keyboard_left.enabled || profile.mouse_left.enabled ||
+        profile.right_mouse_left.enabled ||
         profile.control_mode == ControlMode::DroneMouseAim) {
         flags |= kSbusTrainerMaskLeftActive;
     }
@@ -5381,6 +5497,30 @@ bool LoadTrainerProfile(const char* path, TrainerProfile* profile) {
         profile->mouse_left.yaw_return_shape = profile->return_shape;
     }
 
+    auto right_mouse_left = config["right_mouse_left_stick"];
+    profile->right_mouse_left.enabled =
+        right_mouse_left["enabled"].value_or(profile->right_mouse_left.enabled);
+    profile->right_mouse_left.invert_throttle =
+        right_mouse_left["invert_throttle"].value_or(profile->right_mouse_left.invert_throttle);
+    profile->right_mouse_left.invert_yaw =
+        right_mouse_left["invert_yaw"].value_or(profile->right_mouse_left.invert_yaw);
+    profile->right_mouse_left.swap_axes =
+        right_mouse_left["swap_axes"].value_or(profile->right_mouse_left.swap_axes);
+    profile->right_mouse_left.throttle_step =
+        right_mouse_left["throttle_step"].value_or(profile->right_mouse_left.throttle_step);
+    profile->right_mouse_left.throttle_button_rate =
+        right_mouse_left["throttle_button_rate"].value_or(profile->right_mouse_left.throttle_button_rate);
+    profile->right_mouse_left.throttle_return_enabled =
+        right_mouse_left["throttle_return_enabled"].value_or(profile->right_mouse_left.throttle_return_enabled);
+    profile->right_mouse_left.throttle_return_rate =
+        right_mouse_left["throttle_return_rate"].value_or(profile->right_mouse_left.throttle_return_rate);
+    profile->right_mouse_left.yaw_pulse =
+        right_mouse_left["yaw_pulse"].value_or(profile->right_mouse_left.yaw_pulse);
+    profile->right_mouse_left.yaw_scroll_step =
+        right_mouse_left["yaw_scroll_step"].value_or(profile->right_mouse_left.yaw_scroll_step);
+    profile->right_mouse_left.yaw_slew_rate =
+        right_mouse_left["yaw_slew_rate"].value_or(profile->right_mouse_left.yaw_slew_rate);
+
     auto keyboard = config["keyboard_left_stick"];
     profile->keyboard_left.enabled = keyboard["enabled"].value_or(profile->keyboard_left.enabled);
     profile->keyboard_left.block_selected_keys = keyboard["block_selected_keys"].value_or(profile->keyboard_left.block_selected_keys);
@@ -5597,6 +5737,21 @@ void PrintTrainerProfile(const TrainerProfile& profile, bool guided) {
                         profile.mouse_left.yaw_adaptive_curve,
                         profile.mouse_left.yaw_adaptive_tracker_ms);
         }
+    }
+    if (profile.right_mouse_left.enabled) {
+        std::printf("  right_mouse_left_stick: enabled=true mapping=%s throttle_step=%.1f throttle_button_rate=%.1f/s return=%s %.1f/s yaw_max=%d yaw_scroll_step=%.1f yaw_response=%.1f/s invert_throttle=%s invert_yaw=%s\n",
+                    profile.right_mouse_left.swap_axes
+                        ? "mouse4/mouse5=throttle scroll=yaw"
+                        : "mouse4/mouse5=yaw scroll=throttle",
+                    profile.right_mouse_left.throttle_step,
+                    profile.right_mouse_left.throttle_button_rate,
+                    profile.right_mouse_left.throttle_return_enabled ? "true" : "false",
+                    profile.right_mouse_left.throttle_return_rate,
+                    profile.right_mouse_left.yaw_pulse,
+                    profile.right_mouse_left.yaw_scroll_step,
+                    profile.right_mouse_left.yaw_slew_rate,
+                    profile.right_mouse_left.invert_throttle ? "true" : "false",
+                    profile.right_mouse_left.invert_yaw ? "true" : "false");
     }
     if (profile.keyboard_left.enabled) {
         std::printf("  keyboard_left_stick: enabled=true source=%s require_analog=%s block_selected_keys=%s throttle=%s/%s cut=%s throttle_speed=%.1f/s return=%s %.1f/s yaw=%s/%s max_yaw=%d yaw_response=%.1f/s invert_yaw=%s\n",
@@ -6095,8 +6250,11 @@ void PrintGuidedTuningNotes(const TrainerProfile& profile) {
         std::printf("  3. SYS -> Trainer should replace Ail/Ele only; set Thr/Rud trainer modes OFF.\n");
         std::printf("  4. Model mixes should keep local throttle/yaw on I2/I3 and route TR1/TR2 only for mouse axes.\n");
     }
-    if (profile.keyboard_left.enabled) {
-        std::printf("     Keyboard-left-stick profiles are sim-only: route trainer Thr/Rud only for VelociDrone tests.\n");
+    if (profile.keyboard_left.enabled || profile.right_mouse_left.enabled) {
+        std::printf("     Button/keyboard left-stick profiles are sim-only: route trainer Thr/Rud only for VelociDrone tests.\n");
+    }
+    if (profile.mouse_left.enabled) {
+        std::printf("     Second-mouse left-stick profiles are sim-only: route trainer Thr/Rud only for VelociDrone tests.\n");
     }
     if (profile.control_mode == ControlMode::DroneMouseAim) {
         std::printf("     Reticle Aim is open-loop and sim-first: use channel monitor / VelociDrone before RF use.\n");
@@ -6245,6 +6403,14 @@ int RunTrainerProfile(const TrainerProfile& initial_profile, bool guided, bool l
                     active_profile.mouse_left_device_token.c_str(),
                     active_profile.freeze_key.c_str(),
                     active_profile.stop_key.c_str());
+    } else if (active_profile.right_mouse_left.enabled) {
+        std::printf("input_capture=gameinput-background right-mouse buttons+scroll. right=%s mapping=%s. Keep VelociDrone foreground; %s toggles cursor lock; %s stops and sends neutral SBUS.\n",
+                    active_profile.mouse_right_device_token.c_str(),
+                    active_profile.right_mouse_left.swap_axes
+                        ? "mouse4/mouse5=throttle scroll=yaw"
+                        : "mouse4/mouse5=yaw scroll=throttle",
+                    active_profile.freeze_key.c_str(),
+                    active_profile.stop_key.c_str());
     } else if (active_profile.keyboard_left.enabled) {
         std::printf("input_capture=gameinput-background mouse+keyboard. keyboard_source=%s%s. Keep VelociDrone foreground; key_block=%s; %s toggles cursor lock; %s stops and sends neutral SBUS.\n",
                     KeyboardInputSourceName(active_profile.keyboard_left.input_source),
@@ -6258,9 +6424,9 @@ int RunTrainerProfile(const TrainerProfile& initial_profile, bool guided, bool l
                     active_profile.stop_key.c_str());
     }
 #else
-    if (active_profile.keyboard_left.enabled) {
+    if (active_profile.keyboard_left.enabled || active_profile.right_mouse_left.enabled) {
         std::fprintf(stderr,
-                     "keyboard_left_stick requires a Microsoft.GameInput build; this binary only has foreground Raw Input.\n");
+                     "keyboard/right-mouse left-stick sources require a Microsoft.GameInput build; this binary only has foreground Raw Input.\n");
         CloseHandle(serial);
         if (launcher_stop_event) CloseHandle(launcher_stop_event);
         return 2;
@@ -6295,6 +6461,8 @@ int RunTrainerProfile(const TrainerProfile& initial_profile, bool guided, bool l
         }
         if (active_profile.mouse_left.enabled) {
             std::printf("Sends SBUS ch1/ch2 from right mouse and ch3/ch4 from left mouse; remaining trainer channels centered. Sim-only.\n\n");
+        } else if (active_profile.right_mouse_left.enabled) {
+            std::printf("Sends SBUS ch1/ch2 from right mouse and ch3/ch4 from right mouse Mouse4/Mouse5 + scroll; remaining trainer channels centered. Sim-only.\n\n");
         } else if (active_profile.keyboard_left.enabled) {
             std::printf("Sends SBUS ch1=roll, ch2=pitch, ch3=keyboard throttle, ch4=keyboard yaw; remaining trainer channels centered. Sim-only.\n\n");
         } else if (active_profile.control_mode == ControlMode::DroneMouseAim) {
@@ -6357,6 +6525,7 @@ int RunTrainerProfile(const TrainerProfile& initial_profile, bool guided, bool l
     int last_yaw = 0;
     int64_t last_mapper_dx = 0;
     int64_t last_mapper_dy = 0;
+    int64_t last_right_mapper_wheel_y = 0;
     int64_t last_left_mapper_dx = 0;
     int64_t last_left_mapper_dy = 0;
     double filtered_roll = 0.0;
@@ -6373,6 +6542,8 @@ int RunTrainerProfile(const TrainerProfile& initial_profile, bool guided, bool l
     MouseAimState mouse_aim_state;
     double keyboard_throttle = static_cast<double>(TrainerProfileLowValue());
     double keyboard_yaw = 0.0;
+    double right_mouse_left_yaw_target = 0.0;
+    double right_mouse_left_yaw_output = 0.0;
     AnalogKeyDepths last_analog_depths;
     bool last_freeze_down = false;
 
@@ -6439,6 +6610,11 @@ int RunTrainerProfile(const TrainerProfile& initial_profile, bool guided, bool l
                         reloaded.mouse_left.yaw_input_filter != active_profile.mouse_left.yaw_input_filter ||
                         reloaded.mouse_left.yaw_input_gain_mode != active_profile.mouse_left.yaw_input_gain_mode ||
                         reloaded.mouse_left.yaw_gate_shape != active_profile.mouse_left.yaw_gate_shape;
+                    const bool right_mouse_left_changed =
+                        reloaded.right_mouse_left.enabled != active_profile.right_mouse_left.enabled ||
+                        reloaded.right_mouse_left.swap_axes != active_profile.right_mouse_left.swap_axes ||
+                        reloaded.right_mouse_left.yaw_pulse != active_profile.right_mouse_left.yaw_pulse ||
+                        reloaded.right_mouse_left.yaw_slew_rate != active_profile.right_mouse_left.yaw_slew_rate;
                     active_profile = reloaded;
                     g_stop_virtual_key.store(active_profile.stop_key_vk, std::memory_order_release);
                     g_freeze_virtual_key.store(active_profile.freeze_key_vk, std::memory_order_release);
@@ -6466,6 +6642,13 @@ int RunTrainerProfile(const TrainerProfile& initial_profile, bool guided, bool l
                         left_yaw_elastic_state = ElasticAxisState{};
                         left_yaw_dummy_state = ElasticAxisState{};
                         left_yaw_mapper_state = RightStickSharedState{};
+                        if (active_profile.control_mode == ControlMode::DirectMouse) {
+                            last_yaw = 0;
+                        }
+                    }
+                    if (right_mouse_left_changed) {
+                        right_mouse_left_yaw_target = 0.0;
+                        right_mouse_left_yaw_output = 0.0;
                         if (active_profile.control_mode == ControlMode::DirectMouse) {
                             last_yaw = 0;
                         }
@@ -6505,20 +6688,25 @@ int RunTrainerProfile(const TrainerProfile& initial_profile, bool guided, bool l
                         keyboard_block_signature = new_block_signature;
                     }
 #endif
-                    if (!active_profile.keyboard_left.enabled && !active_profile.mouse_left.enabled) {
+                    if (!active_profile.keyboard_left.enabled &&
+                        !active_profile.mouse_left.enabled &&
+                        !active_profile.right_mouse_left.enabled) {
                         keyboard_throttle = static_cast<double>(TrainerProfileLowValue());
                         keyboard_yaw = 0.0;
+                        right_mouse_left_yaw_target = 0.0;
+                        right_mouse_left_yaw_output = 0.0;
                         last_throttle = QuantizeTrainerProfileOutput(
                             keyboard_throttle,
                             active_profile.resolution_mode);
                         last_yaw = 0;
                     }
-                    std::printf("\nprofile_reload=ok frame_rate=%d mode=%s resolution=%s mouse_stick=%s mouse_left=%s keyboard=%s block_keys=%s%s%s\n",
+                    std::printf("\nprofile_reload=ok frame_rate=%d mode=%s resolution=%s mouse_stick=%s mouse_left=%s right_mouse_left=%s keyboard=%s block_keys=%s%s%s\n",
                                 active_profile.frame_rate_hz,
                                 ControlModeName(active_profile.control_mode),
                                 TrainerResolutionModeName(active_profile.resolution_mode),
                                 active_profile.mouse_right_stick_enabled ? "on" : "off",
                                 active_profile.mouse_left.enabled ? "on" : "off",
+                                active_profile.right_mouse_left.enabled ? "on" : "off",
                                 active_profile.keyboard_left.enabled ? "on" : "off",
                                 active_profile.keyboard_left.block_selected_keys ? "on" : "off",
                                 port_changed ? " note=port-change-requires-restart" : "",
@@ -6542,6 +6730,8 @@ int RunTrainerProfile(const TrainerProfile& initial_profile, bool guided, bool l
             const GameInputMouseRoleSnapshot current_left = SnapshotGameInputRole(gameinput_capture.stats.left_mouse);
             last_mapper_dx = current_right.dx_sum - last_right_mapper.dx_sum;
             last_mapper_dy = current_right.dy_sum - last_right_mapper.dy_sum;
+            last_right_mapper_wheel_y =
+                current_right.wheel_y_sum - last_right_mapper.wheel_y_sum;
             last_left_mapper_dx = current_left.dx_sum - last_left_mapper.dx_sum;
             last_left_mapper_dy = current_left.dy_sum - last_left_mapper.dy_sum;
             last_right_mapper = current_right;
@@ -6550,6 +6740,7 @@ int RunTrainerProfile(const TrainerProfile& initial_profile, bool guided, bool l
             const MouseRateStats current = g_mouse_stats;
             last_mapper_dx = current.dx_sum - last_mapper.dx_sum;
             last_mapper_dy = current.dy_sum - last_mapper.dy_sum;
+            last_right_mapper_wheel_y = 0;
             last_left_mapper_dx = 0;
             last_left_mapper_dy = 0;
 #endif
@@ -6763,6 +6954,82 @@ int RunTrainerProfile(const TrainerProfile& initial_profile, bool guided, bool l
                                                             active_profile.resolution_mode);
                 }
 #endif
+            } else if (active_profile.right_mouse_left.enabled) {
+#if defined(GX12_HAS_GAMEINPUT)
+                const auto& source = active_profile.right_mouse_left;
+                const double mapper_dt = 1.0 / static_cast<double>(mapper_rate_hz);
+                const double wheel_axis_raw =
+                    NormalizeGameInputWheelDelta(last_right_mapper_wheel_y);
+                const double button_axis_raw =
+                    static_cast<double>(GameInputMouse4Mouse5Axis(current_right.buttons));
+
+                if (source.swap_axes) {
+                    double throttle_axis = button_axis_raw;
+                    if (source.invert_throttle) {
+                        throttle_axis = -throttle_axis;
+                    }
+                    keyboard_throttle = ClampDouble(keyboard_throttle +
+                                                    throttle_axis *
+                                                    source.throttle_button_rate *
+                                                    mapper_dt,
+                                                    static_cast<double>(TrainerProfileLowValue()),
+                                                    static_cast<double>(kTrainerProfileDomainLimit));
+                    if (source.throttle_return_enabled &&
+                        std::abs(throttle_axis) < 0.001) {
+                        keyboard_throttle = MoveTowardDouble(keyboard_throttle,
+                                                            static_cast<double>(TrainerProfileLowValue()),
+                                                            source.throttle_return_rate *
+                                                            mapper_dt);
+                    }
+
+                    double yaw_wheel_axis = wheel_axis_raw;
+                    if (source.invert_yaw) {
+                        yaw_wheel_axis = -yaw_wheel_axis;
+                    }
+                    if (std::abs(yaw_wheel_axis) > 0.001) {
+                        right_mouse_left_yaw_target =
+                            ClampDouble(right_mouse_left_yaw_target +
+                                            yaw_wheel_axis * source.yaw_scroll_step,
+                                        -static_cast<double>(source.yaw_pulse),
+                                        static_cast<double>(source.yaw_pulse));
+                    }
+                } else {
+                    double throttle_wheel_axis = wheel_axis_raw;
+                    if (source.invert_throttle) {
+                        throttle_wheel_axis = -throttle_wheel_axis;
+                    }
+                    if (std::abs(throttle_wheel_axis) > 0.001) {
+                        keyboard_throttle =
+                            ClampDouble(keyboard_throttle +
+                                            throttle_wheel_axis * source.throttle_step,
+                                        static_cast<double>(TrainerProfileLowValue()),
+                                        static_cast<double>(kTrainerProfileDomainLimit));
+                    } else if (source.throttle_return_enabled) {
+                        keyboard_throttle = MoveTowardDouble(keyboard_throttle,
+                                                            static_cast<double>(TrainerProfileLowValue()),
+                                                            source.throttle_return_rate *
+                                                            mapper_dt);
+                    }
+
+                    double yaw_button_axis = button_axis_raw;
+                    if (source.invert_yaw) {
+                        yaw_button_axis = -yaw_button_axis;
+                    }
+                    right_mouse_left_yaw_target =
+                        yaw_button_axis * static_cast<double>(source.yaw_pulse);
+                }
+
+                last_throttle = QuantizeTrainerProfileOutput(keyboard_throttle,
+                                                             active_profile.resolution_mode);
+                right_mouse_left_yaw_output = source.yaw_slew_rate <= 0.0
+                    ? right_mouse_left_yaw_target
+                    : MoveTowardDouble(right_mouse_left_yaw_output,
+                                       right_mouse_left_yaw_target,
+                                       source.yaw_slew_rate * mapper_dt);
+                keyboard_yaw = right_mouse_left_yaw_output;
+                last_yaw = QuantizeTrainerProfileOutput(right_mouse_left_yaw_output,
+                                                        active_profile.resolution_mode);
+#endif
             } else if (active_profile.keyboard_left.enabled) {
 #if defined(GX12_HAS_GAMEINPUT)
                 const auto selected_key_down = [&gameinput_capture](int vk) {
@@ -6834,6 +7101,8 @@ int RunTrainerProfile(const TrainerProfile& initial_profile, bool guided, bool l
                 left_yaw_elastic_state = ElasticAxisState{};
                 left_yaw_dummy_state = ElasticAxisState{};
                 left_yaw_mapper_state = RightStickSharedState{};
+                right_mouse_left_yaw_target = 0.0;
+                right_mouse_left_yaw_output = 0.0;
                 last_throttle = QuantizeTrainerProfileOutput(
                     static_cast<double>(TrainerProfileLowValue()),
                     active_profile.resolution_mode);

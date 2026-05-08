@@ -29,6 +29,7 @@ public sealed class ProfileSummary
     public bool MouseRightEnabled { get; init; }
     public bool KeyboardEnabled { get; init; }
     public bool MouseLeftEnabled { get; init; }
+    public bool RightMouseLeftEnabled { get; init; }
     public bool OutputShapingEnabled { get; init; }
     public bool ReturnShapingEnabled { get; init; }
     public bool MouseLeftYawShapingEnabled { get; init; }
@@ -49,6 +50,11 @@ public sealed class ProfileSummary
             if (MouseLeftEnabled)
             {
                 return "Second mouse";
+            }
+
+            if (RightMouseLeftEnabled)
+            {
+                return "Right mouse buttons/scroll";
             }
 
             if (!KeyboardEnabled)
