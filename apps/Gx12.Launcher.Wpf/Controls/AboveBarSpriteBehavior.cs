@@ -261,11 +261,15 @@ public static class AboveBarSpriteBehavior
             return translateTransform;
         }
 
-        var currentY = image.RenderTransform is TranslateTransform existing
-            ? existing.Y
+        var currentX = image.RenderTransform is TranslateTransform existingX
+            ? existingX.X
+            : 0;
+        var currentY = image.RenderTransform is TranslateTransform existingY
+            ? existingY.Y
             : 0;
         translateTransform = new TranslateTransform
         {
+            X = currentX,
             Y = currentY
         };
         image.RenderTransform = translateTransform;

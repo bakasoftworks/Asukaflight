@@ -53,7 +53,11 @@ public sealed class ProfileEditorViewModel : ObservableObject
     private string _constantReturnRate = "";
     private bool _elasticReturnEnabled;
     private string _elasticReturnMode = "progressive";
+    private string _elasticReturnMetric = "axis";
+    private string _elasticReturnActivation = "always";
     private string _elasticReturnCoefficient = "";
+    private string _elasticReturnIdleCoefficient = "";
+    private string _elasticReturnTaperMs = "";
     private string _elasticReturnCurve = "";
     private bool _returnShapingEnabled;
     private string _outputShapeNodesText = "[]";
@@ -919,10 +923,34 @@ public sealed class ProfileEditorViewModel : ObservableObject
         set => SetStringValue(ref _elasticReturnMode, value, "mapper", "elastic_return_mode");
     }
 
+    public string ElasticReturnMetric
+    {
+        get => _elasticReturnMetric;
+        set => SetStringValue(ref _elasticReturnMetric, value, "mapper", "elastic_return_metric");
+    }
+
+    public string ElasticReturnActivation
+    {
+        get => _elasticReturnActivation;
+        set => SetStringValue(ref _elasticReturnActivation, value, "mapper", "elastic_return_activation");
+    }
+
     public string ElasticReturnCoefficient
     {
         get => _elasticReturnCoefficient;
         set => SetRawValue(ref _elasticReturnCoefficient, value, "mapper", "elastic_return_coefficient");
+    }
+
+    public string ElasticReturnIdleCoefficient
+    {
+        get => _elasticReturnIdleCoefficient;
+        set => SetRawValue(ref _elasticReturnIdleCoefficient, value, "mapper", "elastic_return_idle_coefficient");
+    }
+
+    public string ElasticReturnTaperMs
+    {
+        get => _elasticReturnTaperMs;
+        set => SetRawValue(ref _elasticReturnTaperMs, value, "mapper", "elastic_return_taper_ms");
     }
 
     public string ElasticReturnCurve
@@ -1435,7 +1463,11 @@ public sealed class ProfileEditorViewModel : ObservableObject
             ConstantReturnRate = document.GetRaw("mapper", "constant_return_rate", "0");
             ElasticReturnEnabled = document.GetBool("mapper", "elastic_return_enabled", false);
             ElasticReturnMode = document.GetString("mapper", "elastic_return_mode", "progressive");
+            ElasticReturnMetric = document.GetString("mapper", "elastic_return_metric", "axis");
+            ElasticReturnActivation = document.GetString("mapper", "elastic_return_activation", "always");
             ElasticReturnCoefficient = document.GetRaw("mapper", "elastic_return_coefficient", "0");
+            ElasticReturnIdleCoefficient = document.GetRaw("mapper", "elastic_return_idle_coefficient", "0");
+            ElasticReturnTaperMs = document.GetRaw("mapper", "elastic_return_taper_ms", "0");
             ElasticReturnCurve = document.GetRaw("mapper", "elastic_return_curve", "0");
             var outputShapingEnabled = document.GetBool("mapper", "output_shaping_enabled", false);
             OutputCurve = document.GetString("mapper", "output_curve", outputShapingEnabled ? "nodes" : "expo");
@@ -2432,8 +2464,20 @@ public sealed class ProfileEditorViewModel : ObservableObject
                 case "mapper.elastic_return_mode":
                     ElasticReturnMode = editValue;
                     break;
+                case "mapper.elastic_return_metric":
+                    ElasticReturnMetric = editValue;
+                    break;
+                case "mapper.elastic_return_activation":
+                    ElasticReturnActivation = editValue;
+                    break;
                 case "mapper.elastic_return_coefficient":
                     ElasticReturnCoefficient = editValue;
+                    break;
+                case "mapper.elastic_return_idle_coefficient":
+                    ElasticReturnIdleCoefficient = editValue;
+                    break;
+                case "mapper.elastic_return_taper_ms":
+                    ElasticReturnTaperMs = editValue;
                     break;
                 case "mapper.elastic_return_curve":
                     ElasticReturnCurve = editValue;

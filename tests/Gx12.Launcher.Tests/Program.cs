@@ -38,6 +38,8 @@ var tests = new (string Name, Action Body)[]
     ("diagnostic commands format gx12mouse arguments", DiagnosticCommandsFormatGx12MouseArguments),
     ("diagnostic runner reports missing executable", DiagnosticRunnerReportsMissingExecutable),
     ("runtime service formats trainer command and rejects missing inputs", RuntimeServiceFormatsTrainerCommandAndRejectsMissingInputs),
+    ("runtime service formats recording and playback commands", RuntimeServiceFormatsRecordingAndPlaybackCommands),
+    ("native playback bank bind can stop active playback", NativePlaybackBankBindCanStopActivePlayback),
     ("runtime service writes console script with delayed result reporting", RuntimeServiceWritesConsoleScriptWithDelayedResultReporting),
     ("diagnostic log store persists recent history", DiagnosticLogStorePersistsRecentHistory),
     ("ui settings service persists tooltip image mappings", UiSettingsServicePersistsTooltipImageMappings),
@@ -47,6 +49,10 @@ var tests = new (string Name, Action Body)[]
     ("tooltip sprite service enumerates png drop folder", TooltipSpriteServiceEnumeratesPngDropFolder),
     ("catalog row handles missing tooltip image mappings", CatalogRowHandlesMissingTooltipImageMappings),
     ("main view model keeps editor during transient selected-profile clears", MainViewModelKeepsEditorDuringTransientSelectedProfileClears),
+    ("main view model formats radio gimbal playback mask", MainViewModelFormatsRadioGimbalPlaybackMask),
+    ("main view model falls back to HID left playback without PC left source", MainViewModelFallsBackToHidLeftPlaybackWithoutPcLeftSource),
+    ("main view model persists recording playback channel toggles", MainViewModelPersistsRecordingPlaybackChannelToggles),
+    ("main view model picks recording and playback files", MainViewModelPicksRecordingAndPlaybackFiles),
     ("release info exposes launcher and publish recipe", ReleaseInfoExposesLauncherAndPublishRecipe),
     ("release publish script omits public symbols", ReleasePublishScriptOmitsPublicSymbols),
     ("distribution publish script packages firmware and release bundle", DistributionPublishScriptPackagesFirmwareAndReleaseBundle),
@@ -55,6 +61,8 @@ var tests = new (string Name, Action Body)[]
     ("main window option controls resolve tooltips", MainWindowOptionControlsResolveTooltips),
     ("main window hides release readiness user surface", MainWindowHidesReleaseReadinessUserSurface),
     ("main window files tab exposes above-bar sprite return controls", MainWindowFilesTabExposesAboveBarSpriteReturnControls),
+    ("hotkey capture formats keys and mouse buttons", HotkeyCaptureFormatsKeysAndMouseButtons),
+    ("main window exposes recording controls", MainWindowExposesRecordingControls),
     ("workspace tabs keep hover scoped to headers and allow overflow", WorkspaceTabsKeepHoverScopedToHeadersAndAllowOverflow),
     ("workspace tabs render optional above-bar sprite", WorkspaceTabsRenderOptionalAboveBarSprite),
     ("above-bar sprite click handler does not throw", AboveBarSpriteClickHandlerDoesNotThrow),
@@ -705,11 +713,178 @@ static void RuntimeServiceFormatsTrainerCommandAndRejectsMissingInputs()
     AssertTrue(commandLine.EndsWith(" live", StringComparison.Ordinal),
         "Runtime command should use live mode.");
 
+    var integratedLine = Gx12RuntimeService.BuildTrainerCommandLine(
+        paths,
+        profilePath,
+        Path.Combine(temp.Path, "logs", "sample.gx12rec.csv"),
+        12,
+        liveReload: true,
+        recordingToggleKey: "F4",
+        playbackLoop: true,
+        playbackBindings: new[]
+        {
+            new PlaybackBindCommand(Path.Combine(temp.Path, "logs", "clip.gx12rec.csv"), "F5", "ail,ele", true)
+        },
+        recordingOverwrite: true,
+        runtimeControlPath: Path.Combine(temp.Path, ".gx12-ui", "runtime-control.tsv"));
+    AssertTrue(integratedLine.Contains("--trainer-profile", StringComparison.Ordinal),
+        "Integrated runtime command should still use the normal trainer profile mode.");
+    AssertTrue(integratedLine.Contains("--recording", StringComparison.Ordinal) &&
+               integratedLine.Contains("--record-duration=12", StringComparison.Ordinal) &&
+               integratedLine.Contains("--record-toggle=F4", StringComparison.Ordinal),
+        "Integrated runtime command should arm recording inside the normal trainer process.");
+    AssertTrue(integratedLine.Contains("--record-overwrite", StringComparison.Ordinal) &&
+               integratedLine.Contains("--runtime-control", StringComparison.Ordinal),
+        "Integrated runtime command should allow live recording/playback settings updates.");
+    AssertTrue(integratedLine.Contains("--playback-loop", StringComparison.Ordinal) &&
+               integratedLine.Contains("--bind-block F5 ail,ele", StringComparison.Ordinal),
+        "Integrated runtime command should arm playback bank binds inside the normal trainer process.");
+
     var result = service.StartCompositeTrainer(paths, profilePath);
     AssertTrue(!result.IsSuccess, "Missing gx12mouse.exe should fail before start.");
     AssertTrue(result.Message.Contains("Missing executable", StringComparison.Ordinal),
         "Missing executable message should be explicit.");
     AssertEqual(commandLine, result.CommandLine, "Failed start should keep the copyable runtime command.");
+}
+
+static void RuntimeServiceFormatsRecordingAndPlaybackCommands()
+{
+    using var temp = new TemporaryDirectory();
+    var profilePath = Path.Combine(temp.Path, "profile.toml");
+    var recordingPath = Path.Combine(temp.Path, "logs", "sample.gx12rec.csv");
+    var paths = new AppPaths(
+        temp.Path,
+        temp.Path,
+        "profile.toml",
+        Path.Combine(temp.Path, "gx12mouse.exe"),
+        Path.Combine(temp.Path, ".gx12-profile-dir"),
+        Path.Combine(temp.Path, ".gx12-default-profile"));
+
+    var recordLine = Gx12RuntimeService.BuildTrainerRecordCommandLine(
+        paths,
+        profilePath,
+        recordingPath,
+        12,
+        liveReload: true,
+        recordingToggleKey: "F4",
+        recordingOverwrite: true,
+        runtimeControlPath: Path.Combine(temp.Path, ".gx12-ui", "runtime-control.tsv"));
+    AssertTrue(recordLine.Contains("--trainer-record", StringComparison.Ordinal),
+        "Recording command should use --trainer-record.");
+    AssertTrue(recordLine.Contains(recordingPath, StringComparison.Ordinal),
+        "Recording command should include the output recording path.");
+    AssertTrue(recordLine.Contains(" 12 live ", StringComparison.Ordinal),
+        "Recording command should include duration and live reload.");
+    AssertTrue(recordLine.Contains("--record-toggle=F4", StringComparison.Ordinal),
+        "Recording command should include the toggle key when configured.");
+    AssertTrue(recordLine.Contains("--record-overwrite", StringComparison.Ordinal) &&
+               recordLine.Contains("--runtime-control", StringComparison.Ordinal),
+        "Recording command should include overwrite and live control options when configured.");
+
+    var immediateRecordLine = Gx12RuntimeService.BuildTrainerRecordCommandLine(
+        paths,
+        profilePath,
+        recordingPath,
+        12,
+        liveReload: false,
+        recordingToggleKey: "off");
+    AssertTrue(!immediateRecordLine.Contains("--record-toggle=", StringComparison.Ordinal),
+        "Recording command should omit the toggle option when it is off.");
+
+    var playbackLine = Gx12RuntimeService.BuildTrainerPlaybackCommandLine(
+        paths,
+        recordingPath,
+        "COM6",
+        true,
+        "radio_ail,radio_ele,radio_thr",
+        "Mouse4");
+    AssertTrue(playbackLine.Contains("--trainer-playback", StringComparison.Ordinal),
+        "Playback command should use --trainer-playback.");
+    AssertTrue(playbackLine.Contains(" COM6 loop ", StringComparison.Ordinal),
+        "Playback command should include port and loop mode.");
+    AssertTrue(playbackLine.Contains("--channels=radio_ail,radio_ele,radio_thr", StringComparison.Ordinal),
+        "Playback command should include the selected channel mask.");
+    AssertTrue(playbackLine.Contains("--trigger=Mouse4", StringComparison.Ordinal),
+        "Playback command should include the trigger when configured.");
+
+    var immediateLine = Gx12RuntimeService.BuildTrainerPlaybackCommandLine(
+        paths,
+        recordingPath,
+        "",
+        false,
+        "ail,ele",
+        "immediate");
+    AssertTrue(immediateLine.Contains(" auto once ", StringComparison.Ordinal),
+        "Blank playback port should normalize to auto and once mode.");
+    AssertTrue(!immediateLine.Contains("--trigger=", StringComparison.Ordinal),
+        "Immediate trigger should not add an explicit trigger argument.");
+
+    var bankLine = Gx12RuntimeService.BuildTrainerPlaybackBankCommandLine(
+        paths,
+        "auto",
+        false,
+        new[]
+        {
+            new PlaybackBindCommand(recordingPath, "F5", "ail,ele", true),
+            new PlaybackBindCommand(Path.Combine(temp.Path, "logs", "second.gx12rec.csv"), "F6", "ail,ele,thr")
+        });
+    AssertTrue(bankLine.Contains("--trainer-playback-bank auto once", StringComparison.Ordinal),
+        "Playback bank command should use the bank mode and shared port/mode.");
+    AssertTrue(bankLine.Contains("--bind-block F5 ail,ele", StringComparison.Ordinal),
+        "Playback bank command should include the first hotkey binding with live input blocking.");
+    AssertTrue(bankLine.Contains("--bind F6 ail,ele,thr", StringComparison.Ordinal),
+        "Playback bank command should include the second hotkey binding.");
+
+    var controlText = Gx12RuntimeService.BuildRuntimeControlText(
+        recordingPath,
+        12,
+        "F4",
+        recordingOverwrite: true,
+        playbackLoop: false,
+        playbackBindings: new[]
+        {
+            new PlaybackBindCommand(recordingPath, "F5", "ail,ele", true)
+        });
+    AssertTrue(controlText.Contains(
+            $"bind\tF5\tail,ele\t{recordingPath}\t1{Environment.NewLine}",
+            StringComparison.Ordinal),
+        "Runtime control file should serialize per-bind live input blocking.");
+
+    var infoLine = Gx12RuntimeService.BuildRecordingInfoCommandLine(paths, recordingPath);
+    AssertTrue(infoLine.Contains("--recording-info", StringComparison.Ordinal),
+        "Recording info command should use --recording-info.");
+}
+
+static void NativePlaybackBankBindCanStopActivePlayback()
+{
+    var sourcePath = Path.Combine(FindRepoRoot(), "src", "main.cpp");
+    var source = File.ReadAllText(sourcePath);
+
+    AssertTrue(source.Contains("PlaybackRunShouldStop(control)", StringComparison.Ordinal),
+        "Playback frame pacing should poll the shared playback stop control.");
+    AssertTrue(source.Contains("playback_control.stop_trigger = &slot.spec.trigger", StringComparison.Ordinal),
+        "Playback bank should arm the active bind key as a stop trigger for its own playback.");
+    AssertTrue(source.Contains("playback_control.stop_trigger_was_down = true", StringComparison.Ordinal),
+        "Playback bank should ignore the initial key-down edge that started playback.");
+    AssertTrue(source.Contains("playback_control.stopped_by_trigger ? \"bind\" : \"no\"", StringComparison.Ordinal),
+        "Playback bank should report active-bind cancellation without treating it as a whole-bank stop.");
+    AssertTrue(source.Contains("playback_bank_integrated=true", StringComparison.Ordinal),
+        "Trainer profile mode should load playback bank binds into the normal runtime process.");
+    AssertTrue(source.Contains("ConsumePlaybackInputInjection", StringComparison.Ordinal) &&
+               source.Contains("sample.mapper_tick != *last_mapper_tick", StringComparison.Ordinal),
+        "Integrated playback should inject recorded raw input once per recorded mapper tick.");
+    AssertTrue(source.Contains("!PlaybackChannelUsesInputInjection(slot.spec.mask, active_profile, ch)", StringComparison.Ordinal),
+        "Integrated playback should not overwrite channels already handled through input injection.");
+    AssertTrue(source.Contains("GameInputMouse4Mouse5Axis(last_right_mapper_buttons)", StringComparison.Ordinal),
+        "Right-mouse left-stick playback should merge recorded Mouse4/Mouse5 state before mapping.");
+    AssertTrue(source.Contains("trainer_flags |= PlaybackActiveFlags(slot.spec.mask, active_profile.resolution_mode)", StringComparison.Ordinal),
+        "Integrated playback should merge playback channel masks into the live trainer frame flags.");
+    AssertTrue(source.Contains("active_recording_options.overwrite_existing", StringComparison.Ordinal) &&
+               source.Contains("recording_clip_base_path != active_recording_options.path", StringComparison.Ordinal),
+        "Toggle recording should support overwrite mode and reset clip numbering when the selected file changes.");
+    AssertTrue(source.Contains("LoadTrainerRuntimeControlFile", StringComparison.Ordinal) &&
+               source.Contains("runtime_control_reload=ok", StringComparison.Ordinal),
+        "The active trainer run should reload recording/playback file choices without a restart.");
 }
 
 static void RuntimeServiceWritesConsoleScriptWithDelayedResultReporting()
@@ -843,11 +1018,38 @@ static void UiSettingsServicePersistsAboveBarSpriteReturnSettings()
 
     defaults.AboveBarSpriteRandomReturnDelay = false;
     defaults.AboveBarSpriteFixedReturnDelaySeconds = 42;
+    defaults.RecordingOverwrite = true;
+    defaults.PlaybackThrottle = true;
+    defaults.PlaybackRudder = true;
+    defaults.PlaybackRadioRightGimbal = true;
+    defaults.PlaybackRecordedTrainerRight = true;
+    defaults.PlaybackRadioLeftGimbal = true;
+    defaults.PlaybackRecordedTrainerLeft = true;
+    defaults.PlaybackBlockLiveInput = true;
+    defaults.PlaybackBindings.Add(new PlaybackBindingSettings
+    {
+        Enabled = true,
+        RecordingPath = "logs\\one.gx12rec.csv",
+        Trigger = "F5",
+        ChannelMask = "ail,ele",
+        BlockLiveInput = true
+    });
     service.Save(paths, defaults);
 
     var loaded = service.Load(paths);
     AssertTrue(!loaded.AboveBarSpriteRandomReturnDelay, "Panel sprite random/fixed mode should persist in .gx12-ui settings.");
     AssertEqual(42, loaded.AboveBarSpriteFixedReturnDelaySeconds, "Panel sprite fixed return seconds should persist in .gx12-ui settings.");
+    AssertTrue(loaded.RecordingOverwrite, "Recording overwrite mode should persist in .gx12-ui settings.");
+    AssertTrue(loaded.PlaybackThrottle, "Recording playback throttle toggle should persist in .gx12-ui settings.");
+    AssertTrue(loaded.PlaybackRudder, "Recording playback rudder toggle should persist in .gx12-ui settings.");
+    AssertTrue(!loaded.PlaybackRadioRightGimbal, "Recorded trainer right-stick mode should win over radio right-gimbal mode if both are set.");
+    AssertTrue(loaded.PlaybackRecordedTrainerRight, "Recording playback recorded-trainer right-stick toggle should persist in .gx12-ui settings.");
+    AssertTrue(!loaded.PlaybackRadioLeftGimbal, "Recorded trainer left-stick mode should win over radio left-gimbal mode if both are set.");
+    AssertTrue(loaded.PlaybackRecordedTrainerLeft, "Recording playback recorded-trainer left-stick toggle should persist in .gx12-ui settings.");
+    AssertTrue(loaded.PlaybackBlockLiveInput, "Recording playback live-input block toggle should persist in .gx12-ui settings.");
+    AssertEqual(1, loaded.PlaybackBindings.Count, "Playback hotkey binds should persist in .gx12-ui settings.");
+    AssertEqual("F5", loaded.PlaybackBindings[0].Trigger, "Playback bind trigger should round-trip.");
+    AssertTrue(loaded.PlaybackBindings[0].BlockLiveInput, "Playback bind live-input block setting should round-trip.");
 
     loaded.AboveBarSpriteFixedReturnDelaySeconds = -5;
     service.Save(paths, loaded);
@@ -940,6 +1142,235 @@ static void MainViewModelKeepsEditorDuringTransientSelectedProfileClears()
     viewModel.Profiles.Clear();
     viewModel.SelectedProfile = null;
     AssertTrue(viewModel.Editor is null, "Clearing the actual profile list should still clear the editor.");
+}
+
+static void MainViewModelFormatsRadioGimbalPlaybackMask()
+{
+    using var temp = CreateTempRepoWithProfiles();
+    var repository = new ProfileRepository(
+        new ProfileDirectoryService(temp.Path),
+        new DelegateProfileValidator((_, _) => ProfileValidationResult.Success("ok")));
+    var viewModel = new MainViewModel(
+        repository,
+        new NullProfileFolderPicker(),
+        new UiSettingsService(),
+        new NullTooltipImagePicker(),
+        new Gx12RuntimeService());
+
+    AssertEqual("trainer_ail,trainer_ele", viewModel.PlaybackChannelMask, "Default playback should use the recorded final trainer right-stick channels.");
+    viewModel.PlaybackRecordedTrainerRight = false;
+    AssertEqual("ail,ele", viewModel.PlaybackChannelMask, "Raw PC mouse playback should remain selectable.");
+    viewModel.PlaybackRadioRightGimbal = true;
+    AssertEqual("radio_ail,radio_ele", viewModel.PlaybackChannelMask, "Radio right-gimbal mode should switch Ail/Ele to HID channels.");
+    viewModel.PlaybackRecordedTrainerRight = true;
+    AssertEqual("trainer_ail,trainer_ele", viewModel.PlaybackChannelMask, "Recorded trainer mode should switch Ail/Ele to final trainer channels.");
+    AssertTrue(!viewModel.PlaybackRadioRightGimbal, "Recorded trainer mode should clear radio right-gimbal mode.");
+    viewModel.PlaybackThrottle = true;
+    viewModel.PlaybackRudder = true;
+    AssertEqual("trainer_ail,trainer_ele,radio_thr,radio_rud", viewModel.PlaybackChannelMask, "Recorded trainer right mode should combine with radio left-gimbal channels.");
+    viewModel.PlaybackRecordedTrainerLeft = true;
+    AssertEqual("trainer_ail,trainer_ele,trainer_thr,trainer_rud", viewModel.PlaybackChannelMask, "Recorded trainer left mode should switch Thr/Rud to final trainer channels.");
+    AssertTrue(!viewModel.PlaybackRadioLeftGimbal, "Recorded trainer left mode should clear radio left-gimbal mode.");
+    viewModel.PlaybackRecordedTrainerLeft = false;
+    AssertEqual("trainer_ail,trainer_ele,thr,rud", viewModel.PlaybackChannelMask, "Clearing both left source modes should select PC left-source reconstruction.");
+    viewModel.PlaybackRadioLeftGimbal = true;
+    AssertEqual("trainer_ail,trainer_ele,radio_thr,radio_rud", viewModel.PlaybackChannelMask, "Radio left-gimbal mode should switch Thr/Rud to HID channels.");
+    viewModel.PlaybackRadioRightGimbal = true;
+    AssertEqual("radio_ail,radio_ele,radio_thr,radio_rud", viewModel.PlaybackChannelMask, "Radio right-gimbal mode should still be selectable after recorded trainer mode.");
+    AssertTrue(!viewModel.PlaybackRecordedTrainerRight, "Radio right-gimbal mode should clear recorded trainer mode.");
+}
+
+static void MainViewModelFallsBackToHidLeftPlaybackWithoutPcLeftSource()
+{
+    using var temp = CreateTempRepoWithProfiles();
+    var profilePath = Path.Combine(temp.Path, "profiles", "whoop-linear.toml");
+    File.WriteAllText(
+        profilePath,
+        "[trainer]\r\n" +
+        "name = \"whoop-linear\"\r\n" +
+        "frame_rate_hz = 1000\r\n");
+    File.WriteAllText(Path.Combine(temp.Path, ".gx12-default-profile"), "whoop-linear.toml\r\n");
+
+    var repository = new ProfileRepository(
+        new ProfileDirectoryService(temp.Path),
+        new DelegateProfileValidator((_, _) => ProfileValidationResult.Success("ok")));
+    var viewModel = new MainViewModel(
+        repository,
+        new NullProfileFolderPicker(),
+        new UiSettingsService(),
+        new NullTooltipImagePicker(),
+        new Gx12RuntimeService());
+
+    viewModel.PlaybackRecordedTrainerRight = false;
+    viewModel.PlaybackRadioLeftGimbal = false;
+    viewModel.PlaybackRecordedTrainerLeft = false;
+    viewModel.PlaybackThrottle = true;
+    viewModel.PlaybackRudder = true;
+    AssertEqual("ail,ele,radio_thr,radio_rud", viewModel.PlaybackChannelMask,
+        "Thr/Rud should fall back to recorded GX12 HID when the selected profile has no PC left-stick playback source.");
+
+    File.AppendAllText(
+        profilePath,
+        "\r\n[right_mouse_left_stick]\r\n" +
+        "enabled = true\r\n");
+    var rawLeftRepository = new ProfileRepository(
+        new ProfileDirectoryService(temp.Path),
+        new DelegateProfileValidator((_, _) => ProfileValidationResult.Success("ok")));
+    var rawLeftViewModel = new MainViewModel(
+        rawLeftRepository,
+        new NullProfileFolderPicker(),
+        new UiSettingsService(),
+        new NullTooltipImagePicker(),
+        new Gx12RuntimeService());
+
+    rawLeftViewModel.PlaybackRecordedTrainerRight = false;
+    rawLeftViewModel.PlaybackRadioLeftGimbal = false;
+    rawLeftViewModel.PlaybackRecordedTrainerLeft = false;
+    rawLeftViewModel.PlaybackThrottle = true;
+    rawLeftViewModel.PlaybackRudder = true;
+    AssertEqual("ail,ele,thr,rud", rawLeftViewModel.PlaybackChannelMask,
+        "Bare Thr/Rud should remain selectable when the selected profile has a PC left-stick playback source.");
+}
+
+static void MainViewModelPersistsRecordingPlaybackChannelToggles()
+{
+    using var temp = CreateTempRepoWithProfiles();
+    var repository = new ProfileRepository(
+        new ProfileDirectoryService(temp.Path),
+        new DelegateProfileValidator((_, _) => ProfileValidationResult.Success("ok")));
+    var uiSettingsService = new UiSettingsService();
+    var viewModel = new MainViewModel(
+        repository,
+        new NullProfileFolderPicker(),
+        uiSettingsService,
+        new NullTooltipImagePicker(),
+        new Gx12RuntimeService());
+
+    viewModel.PlaybackAileron = false;
+    viewModel.PlaybackThrottle = true;
+    viewModel.PlaybackRudder = true;
+    viewModel.PlaybackRecordedTrainerRight = true;
+    viewModel.PlaybackRecordedTrainerLeft = true;
+    viewModel.PlaybackBlockLiveInput = true;
+
+    var saved = uiSettingsService.Load(repository.Paths);
+    AssertTrue(!saved.PlaybackAileron, "Recording playback Ail toggle should save when changed.");
+    AssertTrue(saved.PlaybackElevator, "Recording playback Ele toggle should keep its default enabled value.");
+    AssertTrue(saved.PlaybackThrottle, "Recording playback Thr toggle should save when enabled.");
+    AssertTrue(saved.PlaybackRudder, "Recording playback Rud toggle should save when enabled.");
+    AssertTrue(!saved.PlaybackRadioRightGimbal, "Recording playback radio right-gimbal toggle should stay off when recorded trainer mode is selected.");
+    AssertTrue(saved.PlaybackRecordedTrainerRight, "Recording playback recorded-trainer right-stick toggle should save when enabled.");
+    AssertTrue(!saved.PlaybackRadioLeftGimbal, "Recording playback radio left-gimbal toggle should stay off when recorded trainer left mode is selected.");
+    AssertTrue(saved.PlaybackRecordedTrainerLeft, "Recording playback recorded-trainer left-stick toggle should save when enabled.");
+    AssertTrue(saved.PlaybackBlockLiveInput, "Recording playback live-input block toggle should save when enabled.");
+
+    var restoredViewModel = new MainViewModel(
+        repository,
+        new NullProfileFolderPicker(),
+        uiSettingsService,
+        new NullTooltipImagePicker(),
+        new Gx12RuntimeService());
+    AssertTrue(!restoredViewModel.PlaybackAileron, "Saved Ail toggle should survive a launcher restart.");
+    AssertTrue(restoredViewModel.PlaybackThrottle, "Saved Thr toggle should survive a launcher restart.");
+    AssertTrue(restoredViewModel.PlaybackRudder, "Saved Rud toggle should survive a launcher restart.");
+    AssertTrue(!restoredViewModel.PlaybackRadioRightGimbal, "Saved recorded trainer mode should keep radio right-gimbal mode off.");
+    AssertTrue(restoredViewModel.PlaybackRecordedTrainerRight, "Saved recorded trainer right-stick toggle should survive a launcher restart.");
+    AssertTrue(!restoredViewModel.PlaybackRadioLeftGimbal, "Saved recorded trainer left mode should keep radio left-gimbal mode off.");
+    AssertTrue(restoredViewModel.PlaybackRecordedTrainerLeft, "Saved recorded trainer left-stick toggle should survive a launcher restart.");
+    AssertTrue(restoredViewModel.PlaybackBlockLiveInput, "Saved live-input block toggle should survive a launcher restart.");
+    AssertEqual("trainer_ele,trainer_thr,trainer_rud", restoredViewModel.PlaybackChannelMask, "Restored playback mask should use the saved Recording tab toggles.");
+}
+
+static void MainViewModelPicksRecordingAndPlaybackFiles()
+{
+    using var temp = CreateTempRepoWithProfiles();
+    var profilePath = Path.Combine(temp.Path, "profiles", "whoop-linear.toml");
+    File.WriteAllText(
+        profilePath,
+        "[trainer]\r\n" +
+        "name = \"whoop-linear\"\r\n" +
+        "frame_rate_hz = 1000\r\n");
+    var repository = new ProfileRepository(
+        new ProfileDirectoryService(temp.Path),
+        new DelegateProfileValidator((_, _) => ProfileValidationResult.Success("ok")));
+    var picker = new QueueRecordingFilePicker(
+        new[] { "logs\\chosen-output.gx12rec.csv" },
+        new[] { "logs\\chosen-playback.gx12rec.csv", "logs\\chosen-bind.gx12rec.csv" });
+    var uiSettingsService = new UiSettingsService();
+    var viewModel = new MainViewModel(
+        repository,
+        new NullProfileFolderPicker(),
+        uiSettingsService,
+        new NullTooltipImagePicker(),
+        new Gx12RuntimeService(),
+        recordingFilePicker: picker);
+
+    AssertEqual(viewModel.RecordingPath, viewModel.PlaybackRecordingPath, "Playback should initially track the default recording path.");
+
+    viewModel.ChooseRecordingPathCommand.Execute(null);
+    AssertEqual("logs\\chosen-output.gx12rec.csv", viewModel.RecordingPath, "Recording picker should update the recording output path.");
+    AssertEqual("logs\\chosen-output.gx12rec.csv", viewModel.PlaybackRecordingPath, "Playback should keep tracking recording until the playback path is edited.");
+    AssertTrue(
+        viewModel.TrainerCommandLine.Contains("logs\\chosen-output.gx12rec.csv", StringComparison.Ordinal),
+        "Composite trainer command should use the selected recording output path.");
+    AssertTrue(
+        viewModel.RecordingCommandLine.Contains("logs\\chosen-output.gx12rec.csv", StringComparison.Ordinal),
+        "Dedicated recording command should use the selected recording output path.");
+    AssertTrue(
+        viewModel.RecordingBufferStatusText.Contains("memory", StringComparison.OrdinalIgnoreCase) &&
+        viewModel.RecordingBufferStatusText.Contains("chosen-output.gx12rec.csv", StringComparison.Ordinal),
+        "Recordings UI should make memory-buffered CSV commit behavior visible.");
+    AssertEqual(
+        "logs\\chosen-output.gx12rec.csv",
+        uiSettingsService.Load(repository.Paths).RecordingPath,
+        "Selected recording output path should persist in UI settings.");
+    viewModel.RecordingOverwrite = true;
+    AssertTrue(uiSettingsService.Load(repository.Paths).RecordingOverwrite,
+        "Recording overwrite mode should persist from the Recordings tab.");
+    AssertTrue(viewModel.TrainerCommandLine.Contains("--record-overwrite", StringComparison.Ordinal),
+        "Composite trainer command should include overwrite mode when enabled.");
+    AssertTrue(
+        File.ReadAllText(Gx12RuntimeService.GetRuntimeControlPath(repository.Paths))
+            .Contains("record_overwrite\t1", StringComparison.Ordinal),
+        "Runtime control file should publish overwrite mode for the active trainer run.");
+
+    var restoredViewModel = new MainViewModel(
+        repository,
+        new NullProfileFolderPicker(),
+        uiSettingsService,
+        new NullTooltipImagePicker(),
+        new Gx12RuntimeService(),
+        recordingFilePicker: new QueueRecordingFilePicker(Array.Empty<string?>(), Array.Empty<string?>()));
+    AssertEqual(
+        "logs\\chosen-output.gx12rec.csv",
+        restoredViewModel.RecordingPath,
+        "Saved recording output path should survive a launcher restart.");
+    AssertTrue(
+        restoredViewModel.TrainerCommandLine.Contains("logs\\chosen-output.gx12rec.csv", StringComparison.Ordinal),
+        "Restored composite trainer command should use the saved recording output path.");
+
+    viewModel.ChoosePlaybackPathCommand.Execute(null);
+    AssertEqual("logs\\chosen-output.gx12rec.csv", viewModel.RecordingPath, "Playback picker should not change the recording output path.");
+    AssertEqual("logs\\chosen-playback.gx12rec.csv", viewModel.PlaybackRecordingPath, "Playback picker should update the single playback source.");
+    viewModel.PlaybackBlockLiveInput = true;
+    AssertTrue(
+        viewModel.PlaybackCommandLine.Contains("logs\\chosen-playback.gx12rec.csv", StringComparison.Ordinal),
+        "Single playback command should use the playback file path.");
+    AssertTrue(
+        viewModel.PlaybackCommandLine.Contains("--trainer-profile", StringComparison.Ordinal) &&
+        viewModel.PlaybackCommandLine.Contains("--bind-block F5 trainer_ail,trainer_ele", StringComparison.Ordinal),
+        "Single playback command should arm inline playback with live input blocking inside the normal trainer runtime.");
+    AssertTrue(
+        viewModel.TrainerCommandLine.Contains("--bind-block F5 trainer_ail,trainer_ele", StringComparison.Ordinal),
+        "Composite trainer command should include the selected single playback bind.");
+
+    viewModel.AddPlaybackBindingToggle = true;
+    var binding = viewModel.PlaybackBindings.Single();
+    AssertEqual("logs\\chosen-playback.gx12rec.csv", binding.RecordingPath, "New playback binds should start from the selected playback file.");
+    AssertTrue(binding.BlockLiveInput, "New playback bind rows should inherit the single playback live-input block setting.");
+
+    viewModel.ChoosePlaybackBindingPathCommand.Execute(binding);
+    AssertEqual("logs\\chosen-bind.gx12rec.csv", binding.RecordingPath, "Bind picker should update only the selected bind row.");
 }
 
 static void ReleaseInfoExposesLauncherAndPublishRecipe()
@@ -1270,9 +1701,14 @@ static void WorkspaceTabsRenderOptionalAboveBarSprite()
         GetBindingPath(image, "AboveBarSpriteBehavior.FixedReturnDelaySeconds").Equals("Editor.AboveBarSpriteFixedReturnDelaySeconds", StringComparison.Ordinal),
         "The sprite return behavior should bind to the Files tab fixed seconds setting.");
 
-    var hasTranslateTransform = image.Elements().Any(element =>
-        element.Name.LocalName.Equals("Image.RenderTransform", StringComparison.Ordinal) &&
-        element.Elements().Any(child => child.Name.LocalName.Equals("TranslateTransform", StringComparison.Ordinal)));
+    var translateTransform = image.Elements()
+        .FirstOrDefault(element => element.Name.LocalName.Equals("Image.RenderTransform", StringComparison.Ordinal))
+        ?.Elements()
+        .FirstOrDefault(child => child.Name.LocalName.Equals("TranslateTransform", StringComparison.Ordinal));
+    var hasTranslateTransform = translateTransform is not null;
+    AssertTrue(
+        translateTransform is not null && HasAttributeValue(translateTransform, "X", "40"),
+        "The above-bar sprite should sit 40 pixels farther right so it clears the tab strip.");
     AssertTrue(hasTranslateTransform, "The above-bar sprite should have a translate transform for the hide/return animation.");
 
     var behaviorPath = Path.Combine(FindRepoRoot(), "apps", "Gx12.Launcher.Wpf", "Controls", "AboveBarSpriteBehavior.cs");
@@ -1285,6 +1721,8 @@ static void WorkspaceTabsRenderOptionalAboveBarSprite()
         "The sprite behavior should use a WPF dispatcher timer for the delayed return.");
     AssertTrue(behavior.Contains("Random.Shared.Next(min, max + 1)", StringComparison.Ordinal),
         "The sprite behavior should choose a fresh random return delay inside the configured range.");
+    AssertTrue(behavior.Contains("X = currentX", StringComparison.Ordinal),
+        "The sprite behavior should preserve the template X offset when replacing frozen transforms.");
     AssertTrue(behavior.Contains("GetUseRandomReturnDelay(image)", StringComparison.Ordinal),
         "The sprite behavior should allow random return delay to be disabled.");
     AssertTrue(behavior.Contains("GetFixedReturnDelaySeconds(image)", StringComparison.Ordinal),
@@ -1302,7 +1740,10 @@ static void AboveBarSpriteClickHandlerDoesNotThrow()
     {
         try
         {
-            var frozenTransform = new TranslateTransform();
+            var frozenTransform = new TranslateTransform
+            {
+                X = 40
+            };
             frozenTransform.Freeze();
             var image = new Image
             {
@@ -1325,6 +1766,7 @@ static void AboveBarSpriteClickHandlerDoesNotThrow()
             AssertTrue(
                 image.RenderTransform is TranslateTransform { IsFrozen: false },
                 "The click handler should replace frozen template transforms before animating.");
+            AssertNear(40, ((TranslateTransform)image.RenderTransform).X, "The click handler should preserve the sprite's template X offset.");
             AboveBarSpriteBehavior.SetIsEnabled(image, false);
         }
         catch (Exception exception)
@@ -1413,6 +1855,19 @@ static void MainWindowHidesReleaseReadinessUserSurface()
     AssertTrue(!xaml.Contains("DPI preview", StringComparison.OrdinalIgnoreCase), "DPI preview tooling should not be visible in the user window.");
 }
 
+static void HotkeyCaptureFormatsKeysAndMouseButtons()
+{
+    AssertEqual("F5", HotkeyCapture.FormatKey(Key.F5), "Function keys should format as native trigger names.");
+    AssertEqual("0", HotkeyCapture.FormatKey(Key.D0), "Top-row digits should format as native trigger names.");
+    AssertEqual("Space", HotkeyCapture.FormatKey(Key.Space), "Special keys should format as native trigger names.");
+    AssertEqual("Mouse4", HotkeyCapture.FormatMouseButton(MouseButton.XButton1), "Mouse side button 1 should format as Mouse4.");
+    AssertEqual("Mouse5", HotkeyCapture.FormatMouseButton(MouseButton.XButton2), "Mouse side button 2 should format as Mouse5.");
+    AssertTrue(HotkeyCapture.TryParseKeyboardVirtualKey("F1", out var f1) && f1 == 0x70,
+        "Launcher start/stop hotkey registration should parse the selected profile key.");
+    AssertTrue(!HotkeyCapture.TryParseKeyboardVirtualKey("Mouse4", out _),
+        "Launcher start/stop hotkey registration should stay keyboard-only.");
+}
+
 static void MainWindowFilesTabExposesAboveBarSpriteReturnControls()
 {
     var xamlPath = Path.Combine(FindRepoRoot(), "apps", "Gx12.Launcher.Wpf", "MainWindow.xaml");
@@ -1436,6 +1891,81 @@ static void MainWindowFilesTabExposesAboveBarSpriteReturnControls()
             element.Name.LocalName.Equals("TextBlock", StringComparison.Ordinal) &&
             GetBindingPath(element, "Text").Equals("Editor.AboveBarSpriteReturnSummary", StringComparison.Ordinal)),
         "The Files tab should summarize the active panel-sprite return mode.");
+}
+
+static void MainWindowExposesRecordingControls()
+{
+    var xamlPath = Path.Combine(FindRepoRoot(), "apps", "Gx12.Launcher.Wpf", "MainWindow.xaml");
+    var document = XDocument.Load(xamlPath, LoadOptions.SetLineInfo);
+
+    AssertTrue(
+        document.Descendants().Any(element =>
+            element.Name.LocalName.Equals("TabItem", StringComparison.Ordinal) &&
+            HasAttributeValue(element, "Header", "Recordings")),
+        "MainWindow should expose a Recordings tab.");
+    AssertTrue(HasHotkeyCapture(document, "Editor.StopKey"),
+        "Profile start/stop key should use click-to-capture editing.");
+    AssertTrue(HasHotkeyCapture(document, "Editor.FreezeKey"),
+        "Profile freeze key should use click-to-capture editing.");
+    AssertTrue(HasBoundElement(document, "TextBox", "Text", "RecordingPath"),
+        "Recordings tab should expose the recording file path.");
+    AssertTrue(HasBoundElement(document, "Button", "Command", "ChooseRecordingPathCommand"),
+        "Recordings tab should expose a picker for the recording output path.");
+    AssertTrue(HasBoundElement(document, "TextBox", "Text", "RecordingDurationSeconds"),
+        "Recordings tab should expose the timed capture duration.");
+    AssertTrue(HasBoundElement(document, "CheckBox", "IsChecked", "RecordingLiveReload"),
+        "Recordings tab should expose the live reload toggle.");
+    AssertTrue(HasBoundElement(document, "TextBox", "Text", "RecordingToggleKey"),
+        "Recordings tab should expose the recording toggle key.");
+    AssertTrue(HasHotkeyCapture(document, "RecordingToggleKey"),
+        "Recording toggle key should capture key/mouse presses instead of requiring typed names.");
+    AssertTrue(HasBoundElement(document, "CheckBox", "IsChecked", "RecordingOverwrite"),
+        "Recordings tab should expose overwrite mode for the selected recording file.");
+    AssertTrue(HasBoundElement(document, "TextBlock", "Text", "RecordingBufferStatusText"),
+        "Recordings tab should expose the memory-buffered recording commit status.");
+    AssertTrue(!HasBoundElement(document, "Button", "Command", "StartTrainerRecordingCommand"),
+        "Recordings tab should not require a separate arm-recording button.");
+    AssertTrue(HasBoundElement(document, "Button", "Command", "InspectRecordingCommand"),
+        "Recordings tab should expose the recording-info command.");
+
+    foreach (var bindingPath in new[] { "PlaybackAileron", "PlaybackElevator", "PlaybackThrottle", "PlaybackRudder", "PlaybackRadioRightGimbal", "PlaybackRecordedTrainerRight", "PlaybackRadioLeftGimbal", "PlaybackRecordedTrainerLeft" })
+    {
+        AssertTrue(HasBoundElement(document, "CheckBox", "IsChecked", bindingPath),
+            $"Recordings tab should expose the {bindingPath} playback channel toggle.");
+    }
+
+    AssertTrue(HasBoundElement(document, "TextBox", "Text", "PlaybackPort"),
+        "Recordings tab should expose the playback port.");
+    AssertTrue(HasBoundElement(document, "TextBox", "Text", "PlaybackRecordingPath"),
+        "Recordings tab should expose the single playback file path.");
+    AssertTrue(HasBoundElement(document, "Button", "Command", "ChoosePlaybackPathCommand"),
+        "Recordings tab should expose a picker for the single playback file.");
+    AssertTrue(HasBoundElement(document, "TextBox", "Text", "PlaybackTrigger"),
+        "Recordings tab should expose the playback trigger.");
+    AssertTrue(HasHotkeyCapture(document, "PlaybackTrigger"),
+        "Playback trigger should capture key/mouse presses instead of requiring typed names.");
+    AssertTrue(HasBoundElement(document, "CheckBox", "IsChecked", "PlaybackLoop"),
+        "Recordings tab should expose the playback loop toggle.");
+    AssertTrue(HasBoundElement(document, "CheckBox", "IsChecked", "PlaybackBlockLiveInput"),
+        "Recordings tab should expose the single playback live-input block toggle.");
+    AssertTrue(!HasBoundElement(document, "Button", "Command", "StartTrainerPlaybackCommand"),
+        "Recordings tab should not require arming inline playback.");
+    AssertTrue(HasBoundElement(document, "CheckBox", "IsChecked", "AddPlaybackBindingToggle"),
+        "Recordings tab should expose the add playback bind toggle.");
+    AssertTrue(HasBoundElement(document, "ItemsControl", "ItemsSource", "PlaybackBindings"),
+        "Recordings tab should expose the playback bind list.");
+    AssertTrue(HasHotkeyCapture(document, "Trigger"),
+        "Playback bind rows should capture key/mouse presses instead of requiring typed names.");
+    AssertTrue(HasBoundElement(document, "CheckBox", "IsChecked", "BlockLiveInput"),
+        "Playback bind rows should expose live-input block toggles.");
+    AssertTrue(HasBoundElement(document, "Button", "Command", "DataContext.ChoosePlaybackBindingPathCommand"),
+        "Recordings tab should expose a picker for playback bind files.");
+    AssertTrue(!HasBoundElement(document, "Button", "Command", "StartTrainerPlaybackBankCommand"),
+        "Recordings tab should not require a separate start-bind-bank button.");
+    AssertTrue(HasBoundElement(document, "TextBox", "Text", "PlaybackBankCommandLine"),
+        "Recordings tab should expose the playback bank command line.");
+    AssertTrue(HasBoundElement(document, "TextBox", "Text", "RecordingInfoText"),
+        "Recordings tab should expose recording-info output.");
 }
 
 static bool IsTooltipOptionElement(XElement element)
@@ -1464,6 +1994,25 @@ static string GetTooltipOptionBindingPath(XElement element)
         "Button" => GetBindingPath(element, "Command"),
         _ => ""
     };
+}
+
+static bool HasBoundElement(XDocument document, string localName, string attributeName, string bindingPath)
+{
+    return document
+        .Descendants()
+        .Any(element =>
+            element.Name.LocalName.Equals(localName, StringComparison.Ordinal) &&
+            GetBindingPath(element, attributeName).Equals(bindingPath, StringComparison.Ordinal));
+}
+
+static bool HasHotkeyCapture(XDocument document, string bindingPath)
+{
+    return document
+        .Descendants()
+        .Any(element =>
+            element.Name.LocalName.Equals("TextBox", StringComparison.Ordinal) &&
+            GetBindingPath(element, "Text").Equals(bindingPath, StringComparison.Ordinal) &&
+            HasAttributeValue(element, "HotkeyCapture.IsEnabled", "True"));
 }
 
 static string GetBindingPath(XElement element, string attributeName)
@@ -1719,6 +2268,28 @@ sealed class NullTooltipImagePicker : ITooltipImagePicker
     public string? PickTooltipImage(string initialDirectory)
     {
         return null;
+    }
+}
+
+sealed class QueueRecordingFilePicker : IRecordingFilePicker
+{
+    private readonly Queue<string?> _recordingOutputs;
+    private readonly Queue<string?> _playbackRecordings;
+
+    public QueueRecordingFilePicker(IEnumerable<string?> recordingOutputs, IEnumerable<string?> playbackRecordings)
+    {
+        _recordingOutputs = new Queue<string?>(recordingOutputs);
+        _playbackRecordings = new Queue<string?>(playbackRecordings);
+    }
+
+    public string? PickRecordingOutput(string currentPath, string repoRoot)
+    {
+        return _recordingOutputs.Count == 0 ? null : _recordingOutputs.Dequeue();
+    }
+
+    public string? PickPlaybackRecording(string currentPath, string repoRoot)
+    {
+        return _playbackRecordings.Count == 0 ? null : _playbackRecordings.Dequeue();
     }
 }
 

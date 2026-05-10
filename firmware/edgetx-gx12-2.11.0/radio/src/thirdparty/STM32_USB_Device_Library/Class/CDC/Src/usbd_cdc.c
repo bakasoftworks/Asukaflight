@@ -390,6 +390,10 @@ static uint8_t USBD_CDC_DeInit(USBD_HandleTypeDef *pdev, uint8_t cfgidx)
 {
   UNUSED(cfgidx);
 
+  if (pdev->pClassDataCmsit[pdev->classId] == NULL)
+  {
+    return (uint8_t)USBD_OK;
+  }
 
 #ifdef USE_USBD_COMPOSITE
   /* Get the Endpoints addresses allocated for this CDC class instance */
@@ -412,13 +416,10 @@ static uint8_t USBD_CDC_DeInit(USBD_HandleTypeDef *pdev, uint8_t cfgidx)
   pdev->ep_in[CDCCmdEpAdd & 0xFU].bInterval = 0U;
 
   /* DeInit  physical Interface components */
-  if (pdev->pClassDataCmsit[pdev->classId] != NULL)
-  {
-    ((USBD_CDC_ItfTypeDef *)pdev->pUserData[pdev->classId])->DeInit();
-    (void)USBD_free(pdev->pClassDataCmsit[pdev->classId]);
-    pdev->pClassDataCmsit[pdev->classId] = NULL;
-    pdev->pClassData = NULL;
-  }
+  ((USBD_CDC_ItfTypeDef *)pdev->pUserData[pdev->classId])->DeInit();
+  (void)USBD_free(pdev->pClassDataCmsit[pdev->classId]);
+  pdev->pClassDataCmsit[pdev->classId] = NULL;
+  pdev->pClassData = NULL;
 
   return (uint8_t)USBD_OK;
 }

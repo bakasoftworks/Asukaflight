@@ -12,6 +12,7 @@ public sealed class UiSettingsService
     public const int DefaultAboveBarSpriteFixedReturnDelaySeconds = 60;
     public const int MinAboveBarSpriteFixedReturnDelaySeconds = 1;
     public const int MaxAboveBarSpriteFixedReturnDelaySeconds = 3600;
+    public const int MaxPlaybackBindingSlots = 12;
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -154,6 +155,8 @@ public sealed class UiSettingsService
 
     private static UiSettings Normalize(UiSettings settings)
     {
+        var recordingPath = (settings.RecordingPath ?? string.Empty).Trim();
+
         var normalized = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         foreach (var pair in settings.TooltipImages ?? new Dictionary<string, string>())
         {
@@ -165,9 +168,38 @@ public sealed class UiSettingsService
             normalized[pair.Key.Trim()] = pair.Value.Trim();
         }
 
+        var playbackBindings = (settings.PlaybackBindings ?? new List<PlaybackBindingSettings>())
+            .Where(binding => binding.Enabled)
+            .Where(binding =>
+                !string.IsNullOrWhiteSpace(binding.RecordingPath) ||
+                !string.IsNullOrWhiteSpace(binding.Trigger) ||
+                !string.IsNullOrWhiteSpace(binding.ChannelMask))
+            .Take(MaxPlaybackBindingSlots)
+            .Select(binding => new PlaybackBindingSettings
+            {
+                Enabled = true,
+                RecordingPath = (binding.RecordingPath ?? string.Empty).Trim(),
+                Trigger = string.IsNullOrWhiteSpace(binding.Trigger) ? "F5" : binding.Trigger.Trim(),
+                ChannelMask = string.IsNullOrWhiteSpace(binding.ChannelMask) ? "ail,ele" : binding.ChannelMask.Trim(),
+                BlockLiveInput = binding.BlockLiveInput
+            })
+            .ToList();
+
         return new UiSettings
         {
+            RecordingPath = recordingPath,
+            RecordingOverwrite = settings.RecordingOverwrite,
+            PlaybackAileron = settings.PlaybackAileron,
+            PlaybackElevator = settings.PlaybackElevator,
+            PlaybackThrottle = settings.PlaybackThrottle,
+            PlaybackRudder = settings.PlaybackRudder,
+            PlaybackRadioRightGimbal = settings.PlaybackRadioRightGimbal && !settings.PlaybackRecordedTrainerRight,
+            PlaybackRecordedTrainerRight = settings.PlaybackRecordedTrainerRight,
+            PlaybackRadioLeftGimbal = settings.PlaybackRadioLeftGimbal && !settings.PlaybackRecordedTrainerLeft,
+            PlaybackRecordedTrainerLeft = settings.PlaybackRecordedTrainerLeft,
+            PlaybackBlockLiveInput = settings.PlaybackBlockLiveInput,
             TooltipImages = normalized,
+            PlaybackBindings = playbackBindings,
             AboveBarSpriteRandomReturnDelay = settings.AboveBarSpriteRandomReturnDelay,
             AboveBarSpriteFixedReturnDelaySeconds = ClampAboveBarSpriteFixedReturnDelaySeconds(
                 settings.AboveBarSpriteFixedReturnDelaySeconds)

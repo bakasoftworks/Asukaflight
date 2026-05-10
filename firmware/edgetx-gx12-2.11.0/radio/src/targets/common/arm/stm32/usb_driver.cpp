@@ -67,6 +67,8 @@ static const USBD_DFU_MediaTypeDef* _dfu_media[USBD_DFU_MAX_ITF_NUM] = {nullptr}
 #endif
 
 static bool usbDriverStarted = false;
+static volatile bool usbDriverRestartRequested = false;
+static volatile bool usbDriverStopping = false;
 static usbMode selectedUsbMode = DEFAULT_USB_MODE;
 
 USBD_HandleTypeDef hUsbDevice;
@@ -150,6 +152,8 @@ void usbInit()
 #endif
 
   usbDriverStarted = false;
+  usbDriverRestartRequested = false;
+  usbDriverStopping = false;
 }
 
 extern void usbInitLUNs();
@@ -169,6 +173,10 @@ static uint8_t mscEpAdd[] = {0x81, 0x01};
 
 void usbStart()
 {
+  usbDriverRestartRequested = false;
+  usbDriverStopping = false;
+  USBD_static_reset();
+  memset(&hUsbDevice, 0, sizeof(hUsbDevice));
   USBD_Init(&hUsbDevice, &FS_Desc, DEVICE_ID);
   switch (getSelectedUsbMode()) {
     case USB_MASS_STORAGE_MODE:
@@ -236,13 +244,33 @@ void usbStart()
 void usbStop()
 {
   usbDriverStarted = false;
+  usbDriverStopping = true;
   USBD_DeInit(&hUsbDevice);
+  usbDriverRestartRequested = false;
+  usbDriverStopping = false;
 }
 
 
 bool usbStarted()
 {
   return usbDriverStarted;
+}
+
+extern "C" bool usbRestartPending()
+{
+  return usbDriverRestartRequested;
+}
+
+extern "C" uint8_t usbDriverLowLevelCallbacksEnabled()
+{
+  return (!usbDriverRestartRequested && !usbDriverStopping) ? 1U : 0U;
+}
+
+extern "C" void usbDriverLowLevelDisconnected()
+{
+  if (usbDriverStarted) {
+    usbDriverRestartRequested = true;
+  }
 }
 
 #if defined(BOOT)
@@ -268,6 +296,8 @@ void usbJoystickRestart()
 
   USBD_DeInit(&hUsbDevice);
   delay_ms(100);
+  USBD_static_reset();
+  memset(&hUsbDevice, 0, sizeof(hUsbDevice));
   USBD_Init(&hUsbDevice, &FS_Desc, DEVICE_ID);
 #if defined(USE_USBD_COMPOSITE)
   USBD_RegisterClassComposite(&hUsbDevice, &USBD_CDC, CLASS_TYPE_CDC, cdcEpAdd);
@@ -291,6 +321,8 @@ void usbJoystickRestart()
 */
 void usbJoystickUpdate()
 {
+  if (!usbDriverStarted || usbDriverRestartRequested || usbDriverStopping) return;
+
 #if !defined(USBJ_EX)
    static uint8_t HID_Buffer[HID_IN_PACKET];
 

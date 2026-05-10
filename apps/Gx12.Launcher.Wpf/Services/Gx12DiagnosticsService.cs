@@ -50,6 +50,15 @@ public sealed class Gx12DiagnosticsService
             paths);
     }
 
+    public Gx12DiagnosticCommand BuildRecordingInfo(AppPaths paths, string recordingPath)
+    {
+        return BuildCommand(
+            "Recording info",
+            new[] { "--recording-info", recordingPath },
+            timeoutMilliseconds: 10000,
+            paths);
+    }
+
     public Gx12DiagnosticResult RunGimbalPreview(AppPaths paths, string profilePath, int timeoutMilliseconds = 10000)
     {
         var command = BuildCommand(
@@ -75,6 +84,12 @@ public sealed class Gx12DiagnosticsService
         if (profilePath is not null && !File.Exists(profilePath))
         {
             return Complete(command, startedAt, false, "Profile file is missing.", "");
+        }
+
+        var recordingPath = FindRecordingInfoArgument(command.Arguments);
+        if (recordingPath is not null && !File.Exists(ResolveRepoPath(paths, recordingPath)))
+        {
+            return Complete(command, startedAt, false, "Recording file is missing.", "");
         }
 
         try
@@ -196,6 +211,26 @@ public sealed class Gx12DiagnosticsService
         }
 
         return null;
+    }
+
+    private static string? FindRecordingInfoArgument(IReadOnlyList<string> arguments)
+    {
+        for (var index = 0; index < arguments.Count - 1; index++)
+        {
+            if (arguments[index].Equals("--recording-info", StringComparison.OrdinalIgnoreCase))
+            {
+                return arguments[index + 1];
+            }
+        }
+
+        return null;
+    }
+
+    private static string ResolveRepoPath(AppPaths paths, string value)
+    {
+        return Path.IsPathRooted(value)
+            ? value
+            : Path.Combine(paths.RepoRoot, value);
     }
 
     private static async Task<string> DrainOutput(Task<string> stdoutTask, Task<string> stderrTask)

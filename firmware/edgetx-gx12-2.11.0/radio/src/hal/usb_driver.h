@@ -50,6 +50,9 @@ void usbInit();
 void usbStart();
 void usbStop();
 bool usbStarted();
+EXTERN_C(bool usbRestartPending());
+EXTERN_C(void usbDriverLowLevelDisconnected());
+EXTERN_C(uint8_t usbDriverLowLevelCallbacksEnabled());
 
 EXTERN_C(int getSelectedUsbMode());
 void setSelectedUsbMode(int mode);

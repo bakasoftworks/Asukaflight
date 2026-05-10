@@ -67,7 +67,10 @@ another mouse feeds ch3/ch4 throttle/yaw.
 Measured on a GX12 in USB Joystick mode:
 
 - VID/PID: `0x1209/0x4F54`
-- Report rate: about `500 Hz`
+- Report rate: radio-mode dependent. About `500 Hz` was measured with the
+  older module-period-limited path; about `1000 Hz` was measured after the
+  Mix-1000 joystick-scheduler firmware change. Host ingestion must timestamp
+  reports and not assume a fixed cadence.
 - Report size: `20` bytes
 - Bytes `0..2`: 24 button bits
 - Bytes `3..18`: 8 little-endian `uint16` analog channels
@@ -105,8 +108,8 @@ Measured or relevant limits:
 | PC mapper baseline | 1000 Hz |
 | USB-CDC SBUS decode on GX12 | stable at 8000 Hz tested |
 | EdgeTX trainer-source/mixer sampling | about 1000 Hz (`RX 8000`, `Mix 1000`) |
-| GX12 USB Joystick HID reports | about 500 Hz measured |
-| ExpressLRS RF | up to configured RF packet rate, likely 500 Hz max here |
+| GX12 USB Joystick HID reports | radio-mode dependent; about 500 Hz and about 1000 Hz both measured |
+| ExpressLRS RF | up to configured RF packet rate; often 500 Hz in current testing |
 
 Sending SBUS above 1000 Hz can reduce upstream sample age before the mixer read,
 but cannot raise the mixer or ELRS packet rate.

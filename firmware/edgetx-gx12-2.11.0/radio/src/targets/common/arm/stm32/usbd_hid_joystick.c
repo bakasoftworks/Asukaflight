@@ -329,6 +329,11 @@ static uint8_t USBD_HID_DeInit(USBD_HandleTypeDef *pdev, uint8_t cfgidx)
 {
   UNUSED(cfgidx);
 
+  if (pdev->pClassDataCmsit[pdev->classId] == NULL)
+  {
+    return (uint8_t)USBD_OK;
+  }
+
 #ifdef USE_USBD_COMPOSITE
   /* Get the Endpoints addresses allocated for this class instance */
   HIDInEpAdd  = USBD_CoreGetEPAdd(pdev, USBD_EP_IN, USBD_EP_TYPE_INTR, (uint8_t)pdev->classId);
@@ -340,11 +345,8 @@ static uint8_t USBD_HID_DeInit(USBD_HandleTypeDef *pdev, uint8_t cfgidx)
   pdev->ep_in[HIDInEpAdd & 0xFU].bInterval = 0U;
 
   /* Free allocated memory */
-  if (pdev->pClassDataCmsit[pdev->classId] != NULL)
-  {
-    (void)USBD_free(pdev->pClassDataCmsit[pdev->classId]);
-    pdev->pClassDataCmsit[pdev->classId] = NULL;
-  }
+  (void)USBD_free(pdev->pClassDataCmsit[pdev->classId]);
+  pdev->pClassDataCmsit[pdev->classId] = NULL;
 
   return (uint8_t)USBD_OK;
 }
@@ -634,7 +636,14 @@ static uint8_t USBD_HID_DataIn(USBD_HandleTypeDef *pdev, uint8_t epnum)
   UNUSED(epnum);
   /* Ensure that the FIFO is empty before a new transfer, this condition could
   be caused by  a new transfer before the end of the previous transfer */
-  ((USBD_HID_HandleTypeDef *)pdev->pClassDataCmsit[pdev->classId])->state = USBD_HID_IDLE;
+  USBD_HID_HandleTypeDef *hhid =
+    (USBD_HID_HandleTypeDef *)pdev->pClassDataCmsit[pdev->classId];
+  if (hhid == NULL)
+  {
+    return (uint8_t)USBD_FAIL;
+  }
+
+  hhid->state = USBD_HID_IDLE;
 
   return (uint8_t)USBD_OK;
 }

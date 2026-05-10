@@ -340,7 +340,7 @@
                                    controls:AboveBarSpriteBehavior.UseRandomReturnDelay="{Binding Editor.AboveBarSpriteRandomReturnDelay}"
                                    controls:AboveBarSpriteBehavior.FixedReturnDelaySeconds="{Binding Editor.AboveBarSpriteFixedReturnDelaySeconds}">
                                 <Image.RenderTransform>
-                                    <TranslateTransform />
+                                    <TranslateTransform X="40" />
                                 </Image.RenderTransform>
                             </Image>
                             <Border Grid.Row="1"

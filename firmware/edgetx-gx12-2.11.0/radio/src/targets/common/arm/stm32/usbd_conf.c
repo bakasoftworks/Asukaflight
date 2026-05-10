@@ -34,6 +34,11 @@
 #include "usbd_cdc.h"
 #include "usbd_hid.h"
 
+#if !defined(BOOT)
+extern void usbDriverLowLevelDisconnected(void);
+extern uint8_t usbDriverLowLevelCallbacksEnabled(void);
+#endif
+
 /* USER CODE BEGIN Includes */
 
 /* USER CODE END Includes */
@@ -156,6 +161,9 @@ static void PCD_SetupStageCallback(PCD_HandleTypeDef *hpcd)
 void HAL_PCD_SetupStageCallback(PCD_HandleTypeDef *hpcd)
 #endif /* USE_HAL_PCD_REGISTER_CALLBACKS */
 {
+#if !defined(BOOT)
+  if (!usbDriverLowLevelCallbacksEnabled()) return;
+#endif
   USBD_LL_SetupStage((USBD_HandleTypeDef*)hpcd->pData, (uint8_t *)hpcd->Setup);
 }
 
@@ -171,6 +179,9 @@ static void PCD_DataOutStageCallback(PCD_HandleTypeDef *hpcd, uint8_t epnum)
 void HAL_PCD_DataOutStageCallback(PCD_HandleTypeDef *hpcd, uint8_t epnum)
 #endif /* USE_HAL_PCD_REGISTER_CALLBACKS */
 {
+#if !defined(BOOT)
+  if (!usbDriverLowLevelCallbacksEnabled()) return;
+#endif
   USBD_LL_DataOutStage((USBD_HandleTypeDef*)hpcd->pData, epnum, hpcd->OUT_ep[epnum].xfer_buff);
 }
 
@@ -186,6 +197,9 @@ static void PCD_DataInStageCallback(PCD_HandleTypeDef *hpcd, uint8_t epnum)
 void HAL_PCD_DataInStageCallback(PCD_HandleTypeDef *hpcd, uint8_t epnum)
 #endif /* USE_HAL_PCD_REGISTER_CALLBACKS */
 {
+#if !defined(BOOT)
+  if (!usbDriverLowLevelCallbacksEnabled()) return;
+#endif
   USBD_LL_DataInStage((USBD_HandleTypeDef*)hpcd->pData, epnum, hpcd->IN_ep[epnum].xfer_buff);
 }
 
@@ -200,6 +214,9 @@ static void PCD_SOFCallback(PCD_HandleTypeDef *hpcd)
 void HAL_PCD_SOFCallback(PCD_HandleTypeDef *hpcd)
 #endif /* USE_HAL_PCD_REGISTER_CALLBACKS */
 {
+#if !defined(BOOT)
+  if (!usbDriverLowLevelCallbacksEnabled()) return;
+#endif
   USBD_LL_SOF((USBD_HandleTypeDef*)hpcd->pData);
 }
 
@@ -214,6 +231,9 @@ static void PCD_ResetCallback(PCD_HandleTypeDef *hpcd)
 void HAL_PCD_ResetCallback(PCD_HandleTypeDef *hpcd)
 #endif /* USE_HAL_PCD_REGISTER_CALLBACKS */
 {
+#if !defined(BOOT)
+  if (!usbDriverLowLevelCallbacksEnabled()) return;
+#endif
   USBD_SpeedTypeDef speed = USBD_SPEED_FULL;
 
   if ( hpcd->Init.speed == PCD_SPEED_HIGH)
@@ -247,6 +267,9 @@ static void PCD_SuspendCallback(PCD_HandleTypeDef *hpcd)
 void HAL_PCD_SuspendCallback(PCD_HandleTypeDef *hpcd)
 #endif /* USE_HAL_PCD_REGISTER_CALLBACKS */
 {
+#if !defined(BOOT)
+  if (!usbDriverLowLevelCallbacksEnabled()) return;
+#endif
   /* Inform USB library that core enters in suspend Mode. */
   USBD_LL_Suspend((USBD_HandleTypeDef*)hpcd->pData);
   __HAL_PCD_GATE_PHYCLOCK(hpcd);
@@ -272,6 +295,9 @@ static void PCD_ResumeCallback(PCD_HandleTypeDef *hpcd)
 void HAL_PCD_ResumeCallback(PCD_HandleTypeDef *hpcd)
 #endif /* USE_HAL_PCD_REGISTER_CALLBACKS */
 {
+#if !defined(BOOT)
+  if (!usbDriverLowLevelCallbacksEnabled()) return;
+#endif
   /* USER CODE BEGIN 3 */
 
   /* USER CODE END 3 */
@@ -290,6 +316,9 @@ static void PCD_ISOOUTIncompleteCallback(PCD_HandleTypeDef *hpcd, uint8_t epnum)
 void HAL_PCD_ISOOUTIncompleteCallback(PCD_HandleTypeDef *hpcd, uint8_t epnum)
 #endif /* USE_HAL_PCD_REGISTER_CALLBACKS */
 {
+#if !defined(BOOT)
+  if (!usbDriverLowLevelCallbacksEnabled()) return;
+#endif
   USBD_LL_IsoOUTIncomplete((USBD_HandleTypeDef*)hpcd->pData, epnum);
 }
 
@@ -305,6 +334,9 @@ static void PCD_ISOINIncompleteCallback(PCD_HandleTypeDef *hpcd, uint8_t epnum)
 void HAL_PCD_ISOINIncompleteCallback(PCD_HandleTypeDef *hpcd, uint8_t epnum)
 #endif /* USE_HAL_PCD_REGISTER_CALLBACKS */
 {
+#if !defined(BOOT)
+  if (!usbDriverLowLevelCallbacksEnabled()) return;
+#endif
   USBD_LL_IsoINIncomplete((USBD_HandleTypeDef*)hpcd->pData, epnum);
 }
 
@@ -319,6 +351,9 @@ static void PCD_ConnectCallback(PCD_HandleTypeDef *hpcd)
 void HAL_PCD_ConnectCallback(PCD_HandleTypeDef *hpcd)
 #endif /* USE_HAL_PCD_REGISTER_CALLBACKS */
 {
+#if !defined(BOOT)
+  if (!usbDriverLowLevelCallbacksEnabled()) return;
+#endif
   USBD_LL_DevConnected((USBD_HandleTypeDef*)hpcd->pData);
 }
 
@@ -333,6 +368,10 @@ static void PCD_DisconnectCallback(PCD_HandleTypeDef *hpcd)
 void HAL_PCD_DisconnectCallback(PCD_HandleTypeDef *hpcd)
 #endif /* USE_HAL_PCD_REGISTER_CALLBACKS */
 {
+#if !defined(BOOT)
+  usbDriverLowLevelDisconnected();
+  if (!usbDriverLowLevelCallbacksEnabled()) return;
+#endif
   USBD_LL_DevDisconnected((USBD_HandleTypeDef*)hpcd->pData);
 }
 
@@ -659,19 +698,32 @@ USBD_StatusTypeDef USBD_LL_SetTestMode(USBD_HandleTypeDef *pdev, uint8_t testmod
   * @param  size: Size of allocated memory
   * @retval None
   */
+#define USBD_STATIC_POOL_WORDS \
+  ((MAX(MAX(sizeof(USBD_MSC_BOT_HandleTypeDef), sizeof(USBD_CDC_HandleTypeDef)), \
+        sizeof(USBD_HID_HandleTypeDef)) / 4U) + 1U)
+
+static uint32_t usbd_static_mem[USBD_MAX_SUPPORTED_CLASS][USBD_STATIC_POOL_WORDS];
+static uint8_t usbd_static_used[USBD_MAX_SUPPORTED_CLASS];
+
+void USBD_static_reset(void)
+{
+  memset(usbd_static_mem, 0, sizeof(usbd_static_mem));
+  memset(usbd_static_used, 0, sizeof(usbd_static_used));
+}
+
 void *USBD_static_malloc(uint32_t size)
 {
-  static uint32_t mem[USBD_MAX_SUPPORTED_CLASS]
-                     [(MAX(MAX(sizeof(USBD_MSC_BOT_HandleTypeDef),
-                               sizeof(USBD_CDC_HandleTypeDef)),
-                           sizeof(USBD_HID_HandleTypeDef)) / 4U) + 1U];
-  static uint32_t idx = 0;
-
   UNUSED(size);
-  if (idx >= USBD_MAX_SUPPORTED_CLASS) {
-    idx = 0;
+
+  for (uint32_t i = 0; i < USBD_MAX_SUPPORTED_CLASS; ++i) {
+    if (!usbd_static_used[i]) {
+      usbd_static_used[i] = 1U;
+      memset(usbd_static_mem[i], 0, sizeof(usbd_static_mem[i]));
+      return usbd_static_mem[i];
+    }
   }
-  return mem[idx++];
+
+  return NULL;
 }
 
 /**
@@ -681,7 +733,13 @@ void *USBD_static_malloc(uint32_t size)
   */
 void USBD_static_free(void *p)
 {
-
+  for (uint32_t i = 0; i < USBD_MAX_SUPPORTED_CLASS; ++i) {
+    if (p == usbd_static_mem[i]) {
+      usbd_static_used[i] = 0U;
+      memset(usbd_static_mem[i], 0, sizeof(usbd_static_mem[i]));
+      return;
+    }
+  }
 }
 
 /**

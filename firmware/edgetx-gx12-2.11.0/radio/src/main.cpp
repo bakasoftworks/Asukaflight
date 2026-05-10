@@ -146,18 +146,27 @@ void handleUsbConnection()
 #if defined(STM32) && !defined(SIMU)
 
   static bool _pluggedUsb = false;
+  static tmr10ms_t usbRestartHoldoffStart = 0;
+  constexpr tmr10ms_t USB_RESTART_HOLDOFF_10MS = 150;
+
+  bool usbRestartHoldoffActive =
+      usbRestartHoldoffStart != 0 &&
+      (get_tmr10ms() - usbRestartHoldoffStart) < USB_RESTART_HOLDOFF_10MS;
 
   if (_pluggedUsb && !usbPlugged()) {
     TRACE("USB unplugged");
     closeUsbMenu();
     _pluggedUsb = false;
+    usbRestartHoldoffStart = get_tmr10ms();
   } else if (!_pluggedUsb && usbPlugged()) {
     TRACE("USB plugged");
     _pluggedUsb = true;
     _usbDisabled = false;
   }
 
-  if (!_usbDisabled && !usbStarted() && usbPlugged()) {
+  if (!_usbDisabled && !usbStarted() && usbPlugged() && !usbRestartHoldoffActive) {
+    usbRestartHoldoffStart = 0;
+
     if (getSelectedUsbMode() == USB_UNSELECTED_MODE) {
       if (g_eeGeneral.USBMode == USB_UNSELECTED_MODE) {
         openUsbMenu();
@@ -191,8 +200,9 @@ void handleUsbConnection()
     }
   }
 
-  if (usbStarted() && !usbPlugged()) {
+  if (usbStarted() && (!usbPlugged() || usbRestartPending())) {
     usbStop();
+    usbRestartHoldoffStart = get_tmr10ms();
     TRACE("USB stopped");
     if (getSelectedUsbMode() == USB_MASS_STORAGE_MODE) {
       edgeTxResume();

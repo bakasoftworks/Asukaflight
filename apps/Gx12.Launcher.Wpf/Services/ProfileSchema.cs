@@ -17,7 +17,7 @@ public static class ProfileSchema
             D("trainer", "frame_rate_hz", "Frame rate", SettingKind.Integer, SettingTier.Basic, "Trainer", "Flight Basics", "1000", "Trainer frame rate sent to the GX12.", "1..8000"),
             D("trainer", "resolution_mode", "2x resolution", SettingKind.Enum, SettingTier.Experimental, "Trainer / Resolution", "Flight Basics", "\"legacy\"", "GX12 high-resolution trainer transport mode.", "", "legacy", "gx12_2x"),
 
-            D("safety", "stop_key", "Stop key", SettingKind.String, SettingTier.Basic, "Safety", "Flight Basics", "\"Esc\"", "Global key that stops a managed run."),
+            D("safety", "stop_key", "Start/stop key", SettingKind.String, SettingTier.Basic, "Safety", "Flight Basics", "\"Esc\"", "Global key that starts the selected profile when idle and stops the active managed run."),
             D("safety", "freeze_key", "Freeze key", SettingKind.String, SettingTier.Basic, "Safety", "Flight Basics", "\"F2\"", "Global key that freezes trainer output."),
             D("control", "mode", "Control mode", SettingKind.Enum, SettingTier.Basic, "Control", "Flight Basics", "\"direct_mouse\"", "Selects direct mouse or reticle aim control.", "", "direct_mouse", "drone_mouse_aim"),
 
@@ -67,7 +67,11 @@ public static class ProfileSchema
             D("mapper", "constant_return_rate", "Constant return rate", SettingKind.Number, SettingTier.Basic, "Right Stick / Return", "Settings Catalog", "0", "Constant recentering rate.", ">=0"),
             D("mapper", "elastic_return_enabled", "Elastic return", SettingKind.Boolean, SettingTier.Basic, "Right Stick / Return", "Settings Catalog", "false", "Enable spring-like recentering."),
             D("mapper", "elastic_return_mode", "Elastic return mode", SettingKind.Enum, SettingTier.Basic, "Right Stick / Return", "Settings Catalog", "\"progressive\"", "Elastic return curve family.", "", "progressive", "linear", "smoothstep", "expo"),
+            D("mapper", "elastic_return_metric", "Elastic return metric", SettingKind.Enum, SettingTier.Basic, "Right Stick / Return", "Settings Catalog", "\"axis\"", "Roll/pitch return metric. Diagonal normalized uses one 2D return vector so diagonal holds do not fight two full axis springs.", "", "axis", "diagonal_normalized"),
+            D("mapper", "elastic_return_activation", "Elastic return activation", SettingKind.Enum, SettingTier.Basic, "Right Stick / Return", "Settings Catalog", "\"always\"", "When elastic return is active. While moving uses Elastic coeff while mouse input is present, then fades toward Idle coeff after input stops.", "", "always", "while_moving"),
             D("mapper", "elastic_return_coefficient", "Elastic coefficient", SettingKind.Number, SettingTier.Basic, "Right Stick / Return", "Settings Catalog", "0", "Spring coefficient in 1/s.", ">=0"),
+            D("mapper", "elastic_return_idle_coefficient", "Elastic idle coefficient", SettingKind.Number, SettingTier.Basic, "Right Stick / Return", "Settings Catalog", "0", "Target spring coefficient after mouse input stops while using While moving.", "0..100"),
+            D("mapper", "elastic_return_taper_ms", "Elastic taper ms", SettingKind.Number, SettingTier.Basic, "Right Stick / Return", "Settings Catalog", "0", "Fade time from movement coefficient to idle coefficient after mouse input stops.", "0..5000"),
             D("mapper", "elastic_return_curve", "Elastic curve", SettingKind.Number, SettingTier.Basic, "Right Stick / Return", "Settings Catalog", "0", "Elastic curve strength.", ">=0"),
             D("mapper", "output_shaping_enabled", "Output shaping", SettingKind.Boolean, SettingTier.Advanced, "Right Stick / Shaping", "Settings Catalog", "false", "Enable output shape nodes."),
             D("mapper", "output_shape_nodes", "Output shape nodes", SettingKind.Array, SettingTier.Advanced, "Right Stick / Shaping", "Settings Catalog", "[]", "Right-stick output shape nodes."),

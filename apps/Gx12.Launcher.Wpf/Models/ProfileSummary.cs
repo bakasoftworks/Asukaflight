@@ -68,7 +68,7 @@ public sealed class ProfileSummary
         }
     }
 
-    public string SafetySummary => $"Stop {StopKey} / Freeze {FreezeKey}";
+    public string SafetySummary => $"Start/stop {StopKey} / Freeze {FreezeKey}";
 
     public string GainSummary => $"Roll {RollGain} / Pitch {PitchGain} / Max {MaxOutput}";
 

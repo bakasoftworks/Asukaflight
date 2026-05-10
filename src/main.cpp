@@ -4,14 +4,18 @@
 #include <atomic>
 #include <cctype>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <utility>
@@ -136,9 +140,22 @@ void PrintUsage() {
     std::printf("                                  Send deterministic SBUS roll/pitch sweep over USB-VCP\n");
     std::printf("  gx12mouse --trainer-resolution-self-test\n");
     std::printf("                                  Compare legacy and GX12 2x trainer SBUS quantization\n");
-    std::printf("  gx12mouse --trainer-profile FILE [sec|live]\n");
+    std::printf("  gx12mouse --trainer-profile FILE [sec|live] [--recording PATH --record-toggle=KEY|Mouse4 --record-duration=sec --record-overwrite --runtime-control PATH] [--bind|--bind-block KEY CHANNELS RECORDING ...]\n");
     std::printf("                                  Send mouse-derived SBUS using a TOML tuning profile\n");
-    std::printf("                                  Add 'live' to reload mapper/keyboard edits while running\n");
+    std::printf("                                  Add 'live' to reload mapper/keyboard edits; recording and playback bind hotkeys run inside this trainer process\n");
+    std::printf("                                  Integrated PC-mouse playback replays recorded mapper ticks; --bind-block ignores live input on the bind channels\n");
+    std::printf("  gx12mouse --trainer-record FILE RECORDING [sec|live] [--record-toggle=KEY|Mouse4 --record-overwrite --runtime-control PATH]\n");
+    std::printf("                                  Record input tracks in memory and save the CSV on a background thread when capture stops; optional key toggles capture\n");
+    std::printf("  gx12mouse --trainer-playback RECORDING [COM|auto] [once|loop] [--channels=trainer_right|ail,ele|thr,rud|radio_thr,radio_rud|gimbals] [--trigger=KEY|Mouse4]\n");
+    std::printf("                                  Replay selected recorded channels through composite trainer SBUS\n");
+    std::printf("  gx12mouse --trainer-playback-bank [COM|auto] [once|loop] --bind|--bind-block KEY CHANNELS RECORDING ...\n");
+    std::printf("                                  Arm up to 12 hotkey playback bindings on one trainer serial port\n");
+    std::printf("  gx12mouse --recording-info RECORDING\n");
+    std::printf("                                  Print recording metadata, duration, and available tracks\n");
+    std::printf("  gx12mouse --recording-determinism-audit RECORDING PROFILE [CHANNELS] [--timed-runs=N]\n");
+    std::printf("                                  Offline audit for real recording replay repeatability; no serial port is opened\n");
+    std::printf("  gx12mouse --recording-self-test\n");
+    std::printf("                                  Validate recording parser, channel masks, and trigger parsing\n");
     std::printf("  gx12mouse --mouse-aim-dry-run FILE [sec]\n");
     std::printf("                                  Run a Reticle Aim profile without opening serial\n");
     std::printf("  gx12mouse --mouse-left-dry-run FILE [sec]\n");
@@ -235,6 +252,42 @@ std::vector<HidDeviceEntry> EnumerateHidDevices() {
     }
     hid_free_enumeration(head);
     return devices;
+}
+
+constexpr unsigned short kGx12VendorId  = 0x1209;
+constexpr unsigned short kGx12ProductId = 0x4F54;
+constexpr int kGx12HidReportSize     = 20;
+constexpr int kGx12ChannelCount      = 8;
+constexpr int kGx12ChannelCenter     = 1024;
+
+struct Gx12DecodedReport {
+    uint32_t buttons = 0;  // 24 bits in lower 24
+    int16_t channels[kGx12ChannelCount] = {};
+};
+
+bool DecodeGx12Report(const unsigned char* data, int length, Gx12DecodedReport* out) {
+    if (!data || !out || length < kGx12HidReportSize) {
+        return false;
+    }
+    out->buttons = static_cast<uint32_t>(data[0]) |
+                   (static_cast<uint32_t>(data[1]) << 8) |
+                   (static_cast<uint32_t>(data[2]) << 16);
+    for (int ch = 0; ch < kGx12ChannelCount; ++ch) {
+        const int byte_index = 3 + ch * 2;
+        const uint16_t raw = static_cast<uint16_t>(data[byte_index]) |
+                             (static_cast<uint16_t>(data[byte_index + 1]) << 8);
+        out->channels[ch] = static_cast<int16_t>(static_cast<int>(raw) - kGx12ChannelCenter);
+    }
+    return true;
+}
+
+const HidDeviceEntry* FindGx12Hid(const std::vector<HidDeviceEntry>& devices) {
+    for (const HidDeviceEntry& device : devices) {
+        if (device.vendor_id == kGx12VendorId && device.product_id == kGx12ProductId) {
+            return &device;
+        }
+    }
+    return nullptr;
 }
 
 const char* HidBusName(hid_bus_type bus) {
@@ -352,6 +405,44 @@ std::string HexPrefix(const unsigned char* data, int length) {
     return out;
 }
 
+struct HidReportTiming {
+    uint64_t intervals = 0;
+    uint64_t sum_interval_us = 0;
+    uint64_t min_interval_us = 0;
+    uint64_t max_interval_us = 0;
+    std::chrono::steady_clock::time_point last_report_time{};
+    bool has_last_report_time = false;
+
+    uint64_t Record(std::chrono::steady_clock::time_point now) {
+        if (!has_last_report_time) {
+            last_report_time = now;
+            has_last_report_time = true;
+            return 0;
+        }
+
+        const auto delta = std::chrono::duration_cast<std::chrono::microseconds>(
+                               now - last_report_time)
+                               .count();
+        const uint64_t interval_us = delta > 0 ? static_cast<uint64_t>(delta) : 0;
+        if (intervals == 0 || interval_us < min_interval_us) {
+            min_interval_us = interval_us;
+        }
+        if (interval_us > max_interval_us) {
+            max_interval_us = interval_us;
+        }
+        sum_interval_us += interval_us;
+        ++intervals;
+        last_report_time = now;
+        return interval_us;
+    }
+
+    double AverageIntervalUs() const {
+        return intervals > 0
+                   ? static_cast<double>(sum_interval_us) / static_cast<double>(intervals)
+                   : 0.0;
+    }
+};
+
 struct HidRateStats {
     uint64_t reports = 0;
     uint64_t timeouts = 0;
@@ -361,12 +452,17 @@ struct HidRateStats {
     int max_len = 0;
     int last_len = 0;
     std::array<unsigned char, 16> last_prefix{};
+    HidReportTiming timing;
 };
 
-void RecordHidReport(HidRateStats* stats, const unsigned char* data, int length) {
+void RecordHidReport(HidRateStats* stats,
+                     const unsigned char* data,
+                     int length,
+                     std::chrono::steady_clock::time_point now) {
     ++stats->reports;
     stats->bytes += static_cast<uint64_t>(length);
     stats->last_len = length;
+    stats->timing.Record(now);
     if (stats->min_len == 0 || length < stats->min_len) {
         stats->min_len = length;
     }
@@ -385,13 +481,15 @@ void RecordHidReport(HidRateStats* stats, const unsigned char* data, int length)
 
 void PrintHidRateSample(const HidRateStats& previous,
                         const HidRateStats& current,
+                        double window_seconds,
                         double elapsed_seconds) {
     const uint64_t reports = current.reports - previous.reports;
     const uint64_t timeouts = current.timeouts - previous.timeouts;
     const uint64_t errors = current.errors - previous.errors;
     const uint64_t bytes = current.bytes - previous.bytes;
-    constexpr double kWindowSeconds = 0.250;
-    const double hz = static_cast<double>(reports) / kWindowSeconds;
+    const double hz = window_seconds > 0.0
+                          ? static_cast<double>(reports) / window_seconds
+                          : 0.0;
     const double avg_bytes = reports > 0 ? static_cast<double>(bytes) / reports : 0.0;
     const std::string last = HexPrefix(current.last_prefix.data(), current.last_len);
 
@@ -463,6 +561,7 @@ int RunHidRate(int seconds, int requested_index) {
     const auto start = clock::now();
     const auto end = start + std::chrono::seconds(seconds);
     auto next_print = start + std::chrono::milliseconds(250);
+    auto last_print_time = start;
     HidRateStats stats;
     HidRateStats last_print;
     std::array<unsigned char, 1024> buffer{};
@@ -470,8 +569,9 @@ int RunHidRate(int seconds, int requested_index) {
 
     while (clock::now() < end) {
         const int read = hid_read_timeout(device, buffer.data(), buffer.size(), 1);
+        const auto now = clock::now();
         if (read > 0) {
-            RecordHidReport(&stats, buffer.data(), read);
+            RecordHidReport(&stats, buffer.data(), read, now);
         } else if (read == 0) {
             ++stats.timeouts;
         } else {
@@ -480,13 +580,16 @@ int RunHidRate(int seconds, int requested_index) {
             break;
         }
 
-        const auto now = clock::now();
         if (now >= next_print) {
+            const double window_seconds =
+                std::chrono::duration<double>(now - last_print_time).count();
             PrintHidRateSample(last_print,
                                stats,
+                               window_seconds,
                                std::chrono::duration<double>(now - start).count());
             std::fflush(stdout);
             last_print = stats;
+            last_print_time = now;
             next_print += std::chrono::milliseconds(250);
         }
     }
@@ -503,6 +606,13 @@ int RunHidRate(int seconds, int requested_index) {
                 static_cast<unsigned long long>(stats.bytes));
     if (!last_error.empty()) {
         std::printf("last read error: %s\n", last_error.c_str());
+    }
+    if (stats.timing.intervals > 0) {
+        std::printf("report_interval: avg=%.3f ms min=%.3f ms max=%.3f ms samples=%llu\n",
+                    stats.timing.AverageIntervalUs() / 1000.0,
+                    static_cast<double>(stats.timing.min_interval_us) / 1000.0,
+                    static_cast<double>(stats.timing.max_interval_us) / 1000.0,
+                    static_cast<unsigned long long>(stats.timing.intervals));
     }
 
     hid_close(device);
@@ -2361,6 +2471,16 @@ enum class ElasticReturnMode {
     Expo,
 };
 
+enum class ElasticReturnMetric {
+    Axis,
+    DiagonalNormalized,
+};
+
+enum class ElasticReturnActivation {
+    Always,
+    WhileMoving,
+};
+
 enum class PositionModel {
     Integrator,
     DynamicGimbal,
@@ -3007,6 +3127,7 @@ struct RightStickSharedState {
     double adaptive_speed = 0.0;
     double adaptive_gain = 1.0;
     double gate_scale = 1.0;
+    double elastic_return_idle_seconds = 1000000.0;
     HampelAxisState despike_roll;
     HampelAxisState despike_pitch;
     std::array<uint32_t, 10> despike_recent_buckets{};
@@ -3309,7 +3430,11 @@ struct TrainerProfile {
     double constant_return_rate = 0.0;
     bool elastic_return_enabled = false;
     ElasticReturnMode elastic_return_mode = ElasticReturnMode::Progressive;
+    ElasticReturnMetric elastic_return_metric = ElasticReturnMetric::Axis;
+    ElasticReturnActivation elastic_return_activation = ElasticReturnActivation::Always;
     double elastic_return_coefficient = 0.0;
+    double elastic_return_idle_coefficient = 0.0;
+    double elastic_return_taper_ms = 0.0;
     double elastic_return_curve = 0.0;
     StickShapeCurve output_shape;
     StickShapeCurve return_shape;
@@ -3638,6 +3763,109 @@ bool ParseElasticReturnModeName(const std::string& text, ElasticReturnMode* mode
         return true;
     }
     return false;
+}
+
+const char* ElasticReturnMetricName(ElasticReturnMetric metric) {
+    switch (metric) {
+    case ElasticReturnMetric::Axis:
+        return "axis";
+    case ElasticReturnMetric::DiagonalNormalized:
+        return "diagonal_normalized";
+    }
+    return "axis";
+}
+
+bool ParseElasticReturnMetricName(const std::string& text, ElasticReturnMetric* metric) {
+    const std::string value = ToLowerAscii(text);
+    if (value.empty() || value == "axis" || value == "per_axis" || value == "legacy") {
+        *metric = ElasticReturnMetric::Axis;
+        return true;
+    }
+    if (value == "diagonal_normalized" ||
+        value == "diagonal-normalized" ||
+        value == "diag_normalized" ||
+        value == "vector" ||
+        value == "radial") {
+        *metric = ElasticReturnMetric::DiagonalNormalized;
+        return true;
+    }
+    return false;
+}
+
+const char* ElasticReturnActivationName(ElasticReturnActivation activation) {
+    switch (activation) {
+    case ElasticReturnActivation::Always:
+        return "always";
+    case ElasticReturnActivation::WhileMoving:
+        return "while_moving";
+    }
+    return "always";
+}
+
+bool ParseElasticReturnActivationName(const std::string& text,
+                                      ElasticReturnActivation* activation) {
+    const std::string value = ToLowerAscii(text);
+    if (value.empty() || value == "always" || value == "continuous" ||
+        value == "legacy") {
+        *activation = ElasticReturnActivation::Always;
+        return true;
+    }
+    if (value == "while_moving" ||
+        value == "while-moving" ||
+        value == "moving" ||
+        value == "input_gated" ||
+        value == "input-gated" ||
+        value == "motion_gated" ||
+        value == "motion-gated" ||
+        value == "clutched") {
+        *activation = ElasticReturnActivation::WhileMoving;
+        return true;
+    }
+    return false;
+}
+
+double EffectiveElasticReturnCoefficient(const TrainerProfile& profile,
+                                         double elastic_return_coefficient,
+                                         bool mouse_moved,
+                                         double dt,
+                                         RightStickSharedState* state) {
+    elastic_return_coefficient = std::max(0.0, elastic_return_coefficient);
+    if (elastic_return_coefficient <= 0.0) {
+        return 0.0;
+    }
+    if (profile.elastic_return_activation == ElasticReturnActivation::Always) {
+        if (state && mouse_moved) {
+            state->elastic_return_idle_seconds = 0.0;
+        }
+        return elastic_return_coefficient;
+    }
+
+    if (mouse_moved) {
+        if (state) {
+            state->elastic_return_idle_seconds = 0.0;
+        }
+        return elastic_return_coefficient;
+    }
+
+    double idle_seconds = 1000000.0;
+    if (state) {
+        state->elastic_return_idle_seconds =
+            std::min(1000000.0,
+                     state->elastic_return_idle_seconds + std::max(0.0, dt));
+        idle_seconds = state->elastic_return_idle_seconds;
+    }
+
+    const double target_coefficient =
+        ClampDouble(profile.elastic_return_idle_coefficient,
+                    0.0,
+                    elastic_return_coefficient);
+    const double taper_seconds = std::max(0.0, profile.elastic_return_taper_ms) / 1000.0;
+    if (taper_seconds <= 0.0) {
+        return target_coefficient;
+    }
+
+    const double t = ClampDouble(idle_seconds / taper_seconds, 0.0, 1.0);
+    return LerpDouble(elastic_return_coefficient, target_coefficient, t);
 }
 
 double ElasticReturnCurveScale(double norm, ElasticReturnMode mode, double curve) {
@@ -4050,6 +4278,49 @@ void ApplyRightStickAxisReturn(double return_step,
     }
 }
 
+void ApplyRightStickDiagonalNormalizedReturn(double return_step,
+                                             double elastic_return_coefficient,
+                                             ElasticReturnMode elastic_return_mode,
+                                             double elastic_return_curve,
+                                             double dt,
+                                             bool apply_return,
+                                             double* roll_position,
+                                             double* pitch_position,
+                                             const TrainerProfile& profile) {
+    if (!apply_return || !roll_position || !pitch_position) {
+        return;
+    }
+
+    const double roll = *roll_position;
+    const double pitch = *pitch_position;
+    const double radius = std::sqrt((roll * roll) + (pitch * pitch));
+    if (radius <= 0.0) {
+        return;
+    }
+
+    const double basis = std::max(std::abs(roll), std::abs(pitch));
+    double step = return_step;
+    step += ShapedElasticReturnRatePerSecond(basis,
+                                             profile.max_output,
+                                             elastic_return_coefficient,
+                                             elastic_return_mode,
+                                             elastic_return_curve,
+                                             profile.return_shape) *
+            dt;
+    if (step <= 0.0) {
+        return;
+    }
+    if (step >= radius) {
+        *roll_position = 0.0;
+        *pitch_position = 0.0;
+        return;
+    }
+
+    const double scale = (radius - step) / radius;
+    *roll_position = roll * scale;
+    *pitch_position = pitch * scale;
+}
+
 void StepDynamicGimbalAxis(double input,
                            double dt,
                            double* position,
@@ -4199,6 +4470,8 @@ void ShapeRightStickPositionPulses(double roll_source,
                                    const TrainerProfile& profile,
                                    int* roll_pulse,
                                    int* pitch_pulse) {
+    const bool mouse_moved = std::abs(roll_source) > 0.0 ||
+                             std::abs(pitch_source) > 0.0;
     ApplyRightStickInputPreprocessors(&roll_source,
                                       &pitch_source,
                                       dt,
@@ -4218,9 +4491,33 @@ void ShapeRightStickPositionPulses(double roll_source,
         pitch_input = -pitch_input;
     }
 
-    if (apply_return) {
+    const double active_elastic_return_coefficient =
+        (apply_return &&
+         elastic_return_coefficient > 0.0)
+            ? EffectiveElasticReturnCoefficient(profile,
+                                                elastic_return_coefficient,
+                                                mouse_moved,
+                                                dt,
+                                                shared_state)
+            : 0.0;
+    const bool apply_any_return = apply_return &&
+                                  (return_step > 0.0 ||
+                                   active_elastic_return_coefficient > 0.0);
+
+    if (apply_any_return &&
+        profile.elastic_return_metric == ElasticReturnMetric::DiagonalNormalized) {
+        ApplyRightStickDiagonalNormalizedReturn(return_step,
+                                                active_elastic_return_coefficient,
+                                                profile.elastic_return_mode,
+                                                profile.elastic_return_curve,
+                                                dt,
+                                                true,
+                                                roll_position,
+                                                pitch_position,
+                                                profile);
+    } else if (apply_any_return) {
         ApplyRightStickAxisReturn(return_step,
-                                  elastic_return_coefficient,
+                                  active_elastic_return_coefficient,
                                   profile.elastic_return_mode,
                                   profile.elastic_return_curve,
                                   dt,
@@ -4228,7 +4525,7 @@ void ShapeRightStickPositionPulses(double roll_source,
                                   roll_position,
                                   profile);
         ApplyRightStickAxisReturn(return_step,
-                                  elastic_return_coefficient,
+                                  active_elastic_return_coefficient,
                                   profile.elastic_return_mode,
                                   profile.elastic_return_curve,
                                   dt,
@@ -4674,6 +4971,15 @@ bool ValidateTrainerProfile(const TrainerProfile& profile) {
     }
     if (profile.elastic_return_coefficient < 0.0 || profile.elastic_return_coefficient > 100.0) {
         std::fprintf(stderr, "profile error: mapper.elastic_return_coefficient must be 0..100 per second.\n");
+        return false;
+    }
+    if (profile.elastic_return_idle_coefficient < 0.0 ||
+        profile.elastic_return_idle_coefficient > 100.0) {
+        std::fprintf(stderr, "profile error: mapper.elastic_return_idle_coefficient must be 0..100 per second.\n");
+        return false;
+    }
+    if (profile.elastic_return_taper_ms < 0.0 || profile.elastic_return_taper_ms > 5000.0) {
+        std::fprintf(stderr, "profile error: mapper.elastic_return_taper_ms must be 0..5000 milliseconds.\n");
         return false;
     }
     if (profile.elastic_return_curve < 0.0 || profile.elastic_return_curve > 5.0) {
@@ -5232,7 +5538,27 @@ bool LoadTrainerProfile(const char* path, TrainerProfile* profile) {
                      "profile error: mapper.elastic_return_mode must be linear, progressive, smoothstep, or expo.\n");
         return false;
     }
+    const std::string elastic_return_metric_text =
+        mapper["elastic_return_metric"].value_or(std::string(ElasticReturnMetricName(profile->elastic_return_metric)));
+    if (!ParseElasticReturnMetricName(elastic_return_metric_text, &profile->elastic_return_metric)) {
+        std::fprintf(stderr,
+                     "profile error: mapper.elastic_return_metric must be axis or diagonal_normalized.\n");
+        return false;
+    }
+    const std::string elastic_return_activation_text =
+        mapper["elastic_return_activation"].value_or(
+            std::string(ElasticReturnActivationName(profile->elastic_return_activation)));
+    if (!ParseElasticReturnActivationName(elastic_return_activation_text,
+                                          &profile->elastic_return_activation)) {
+        std::fprintf(stderr,
+                     "profile error: mapper.elastic_return_activation must be always or while_moving.\n");
+        return false;
+    }
     profile->elastic_return_coefficient = mapper["elastic_return_coefficient"].value_or(profile->elastic_return_coefficient);
+    profile->elastic_return_idle_coefficient =
+        mapper["elastic_return_idle_coefficient"].value_or(profile->elastic_return_idle_coefficient);
+    profile->elastic_return_taper_ms =
+        mapper["elastic_return_taper_ms"].value_or(profile->elastic_return_taper_ms);
     profile->elastic_return_curve = mapper["elastic_return_curve"].value_or(profile->elastic_return_curve);
     profile->output_shape.enabled = mapper["output_shaping_enabled"].value_or(profile->output_shape.enabled);
     profile->return_shape.enabled = mapper["return_shaping_enabled"].value_or(profile->return_shape.enabled);
@@ -5591,7 +5917,7 @@ void PrintTrainerProfile(const TrainerProfile& profile, bool guided) {
                 profile.freeze_key.c_str());
     const int mapper_rate_hz = std::min(profile.frame_rate_hz, kTrainerMapperReferenceHz);
     const double gain_scale = TrainerRateGainScale(mapper_rate_hz);
-    std::printf("  mapper: roll_gain=%.3f pitch_gain=%.3f mapper_rate=%d Hz effective_gain=%.3fx max=%d deadband=%d expo=%.3f smoothing=%.3f input_filter=%s idle_return=%s idle_rate=%.1f/s idle_ms=%.1f constant_return=%s constant_rate=%.1f/s elastic_return=%s elastic_mode=%s elastic_coeff=%.3f/s elastic_curve=%.3f\n",
+    std::printf("  mapper: roll_gain=%.3f pitch_gain=%.3f mapper_rate=%d Hz effective_gain=%.3fx max=%d deadband=%d expo=%.3f smoothing=%.3f input_filter=%s idle_return=%s idle_rate=%.1f/s idle_ms=%.1f constant_return=%s constant_rate=%.1f/s elastic_return=%s elastic_mode=%s elastic_metric=%s elastic_activation=%s elastic_coeff=%.3f/s elastic_idle_coeff=%.3f/s elastic_taper_ms=%.1f elastic_curve=%.3f\n",
                 profile.roll_gain,
                 profile.pitch_gain,
                 mapper_rate_hz,
@@ -5608,7 +5934,11 @@ void PrintTrainerProfile(const TrainerProfile& profile, bool guided) {
                 profile.constant_return_rate,
                 profile.elastic_return_enabled ? "true" : "false",
                 ElasticReturnModeName(profile.elastic_return_mode),
+                ElasticReturnMetricName(profile.elastic_return_metric),
+                ElasticReturnActivationName(profile.elastic_return_activation),
                 profile.elastic_return_coefficient,
+                profile.elastic_return_idle_coefficient,
+                profile.elastic_return_taper_ms,
                 profile.elastic_return_curve);
     std::printf("  mapper_filter: despike=%s count=%s window=%d threshold_sigma=%.3f one_euro_min=%.3fHz beta=%.3f dcutoff=%.3fHz\n",
                 profile.despike_enabled ? "true" : "false",
@@ -5805,10 +6135,14 @@ void PrintElasticPreview(const TrainerProfile& profile) {
     std::printf("\n--elastic-preview: profile=%s name='%s'\n",
                 profile.source_file.c_str(),
                 profile.name.c_str());
-    std::printf("  elastic_return=%s mode=%s coefficient=%.3f/s curve=%.3f max=%d mapper_rate=%d Hz\n",
+    std::printf("  elastic_return=%s mode=%s metric=%s activation=%s coefficient=%.3f/s idle_coefficient=%.3f/s taper_ms=%.1f curve=%.3f max=%d mapper_rate=%d Hz\n",
                 profile.elastic_return_enabled ? "true" : "false",
                 ElasticReturnModeName(profile.elastic_return_mode),
+                ElasticReturnMetricName(profile.elastic_return_metric),
+                ElasticReturnActivationName(profile.elastic_return_activation),
                 profile.elastic_return_coefficient,
+                profile.elastic_return_idle_coefficient,
+                profile.elastic_return_taper_ms,
                 profile.elastic_return_curve,
                 profile.max_output,
                 mapper_rate_hz);
@@ -5864,21 +6198,80 @@ void PrintElasticPreview(const TrainerProfile& profile) {
         std::printf("\n");
     }
 
-    std::printf("\n  No-input decay from full stick using selected elastic mode\n");
-    std::printf("  time_ms  position  visual\n");
-    double position = static_cast<double>(profile.max_output);
     const double dt = 1.0 / static_cast<double>(mapper_rate_hz);
+    std::printf("\n  Selected metric return step examples at 50%% deflection\n");
+    std::printf("  position        roll_step  pitch_step  vector_step\n");
+    const double half = 0.5 * static_cast<double>(profile.max_output);
+    const std::array<std::pair<double, double>, 3> metric_samples = {{
+        {half, 0.0},
+        {half, half},
+        {half, half * 0.5},
+    }};
+    for (const auto& sample : metric_samples) {
+        double roll = sample.first;
+        double pitch = sample.second;
+        if (profile.elastic_return_metric == ElasticReturnMetric::DiagonalNormalized) {
+            ApplyRightStickDiagonalNormalizedReturn(0.0,
+                                                    coefficient,
+                                                    profile.elastic_return_mode,
+                                                    profile.elastic_return_curve,
+                                                    dt,
+                                                    true,
+                                                    &roll,
+                                                    &pitch,
+                                                    profile);
+        } else {
+            ApplyRightStickAxisReturn(0.0,
+                                      coefficient,
+                                      profile.elastic_return_mode,
+                                      profile.elastic_return_curve,
+                                      dt,
+                                      true,
+                                      &roll,
+                                      profile);
+            ApplyRightStickAxisReturn(0.0,
+                                      coefficient,
+                                      profile.elastic_return_mode,
+                                      profile.elastic_return_curve,
+                                      dt,
+                                      true,
+                                      &pitch,
+                                      profile);
+        }
+        const double roll_step = sample.first - roll;
+        const double pitch_step = sample.second - pitch;
+        const double vector_step = std::sqrt((roll_step * roll_step) + (pitch_step * pitch_step));
+        std::printf("  %6.1f,%6.1f  %9.3f  %10.3f  %11.3f\n",
+                    sample.first,
+                    sample.second,
+                    roll_step,
+                    pitch_step,
+                    vector_step);
+    }
+
+    std::printf("\n  No-input decay from full stick using selected elastic mode/activation\n");
+    std::printf("  time_ms  coeff/s  position  visual\n");
+    double position = static_cast<double>(profile.max_output);
+    RightStickSharedState preview_state;
+    preview_state.elastic_return_idle_seconds = 0.0;
     int next_sample_ms = 0;
     const int total_ticks = mapper_rate_hz;
     for (int tick = 0; tick <= total_ticks; ++tick) {
+        const double effective_coefficient =
+            EffectiveElasticReturnCoefficient(profile,
+                                              coefficient,
+                                              false,
+                                              tick == 0 ? 0.0 : dt,
+                                              &preview_state);
         const int elapsed_ms = static_cast<int>(std::lround(1000.0 * static_cast<double>(tick) /
                                                             static_cast<double>(mapper_rate_hz)));
         if (elapsed_ms >= next_sample_ms || tick == total_ticks) {
             const double norm = ClampDouble(position / static_cast<double>(profile.max_output), 0.0, 1.0);
             const int bar_count = static_cast<int>(std::lround(norm * kBarWidth));
             const std::string bar(static_cast<size_t>(bar_count), '#');
-            std::printf("  %7d  %8.1f  |%-*s|\n",
+            std::printf("  %7d  %7.3f  %8.1f  |%-*s|\n",
                         elapsed_ms,
+                        effective_coefficient,
                         position,
                         kBarWidth,
                         bar.c_str());
@@ -5889,7 +6282,7 @@ void PrintElasticPreview(const TrainerProfile& profile) {
         }
         const double step = ShapedElasticReturnRatePerSecond(position,
                                                              profile.max_output,
-                                                             coefficient,
+                                                             effective_coefficient,
                                                              profile.elastic_return_mode,
                                                              profile.elastic_return_curve,
                                                              profile.return_shape) *
@@ -6264,37 +6657,1858 @@ void PrintGuidedTuningNotes(const TrainerProfile& profile) {
     std::printf("  %s stops and sends neutral SBUS.\n\n", profile.stop_key.c_str());
 }
 
-bool OpenCsvLog(const TrainerProfile& profile, std::ofstream* csv) {
-    if (!profile.log_csv || profile.log_path.empty()) {
-        return false;
+struct TrainerCsvLogWriter {
+    struct Row {
+        double time_s = 0.0;
+        uint32_t frame = 0;
+        uint64_t mouse_events = 0;
+        uint64_t input_aux = 0;
+        uint64_t keyboard_events = 0;
+        int64_t dx = 0;
+        int64_t dy = 0;
+        double mouse_raw_dx = 0.0;
+        double mouse_raw_dy = 0.0;
+        double mouse_filtered_dx = 0.0;
+        double mouse_filtered_dy = 0.0;
+        uint64_t despike_recent_count = 0;
+        uint64_t despike_total_count = 0;
+        int64_t left_dx = 0;
+        int64_t left_dy = 0;
+        double left_yaw_raw = 0.0;
+        double left_yaw_filtered = 0.0;
+        uint64_t left_despike_recent_count = 0;
+        uint64_t left_despike_total_count = 0;
+        PositionModel left_yaw_position_model = PositionModel::Integrator;
+        double left_yaw_adaptive_gain = 1.0;
+        double left_yaw_gate_scale = 1.0;
+        bool left_yaw_gimbal_antiwindup_active = false;
+        PositionModel position_model = PositionModel::Integrator;
+        double adaptive_gain = 1.0;
+        double gate_scale = 1.0;
+        bool gimbal_antiwindup_active = false;
+        double roll_position = 0.0;
+        double pitch_position = 0.0;
+        double roll_velocity = 0.0;
+        double pitch_velocity = 0.0;
+        int roll = 0;
+        int pitch = 0;
+        int throttle = 0;
+        int yaw = 0;
+        double aim_x = 0.0;
+        double aim_y = 0.0;
+        double analog_throttle_up = 0.0;
+        double analog_throttle_down = 0.0;
+        double analog_yaw_left = 0.0;
+        double analog_yaw_right = 0.0;
+        double analog_cut = 0.0;
+        int64_t late_us = 0;
+    };
+
+    std::ofstream csv;
+    std::string path;
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<Row> queue;
+    std::thread worker;
+    bool open = false;
+    bool stop_requested = false;
+    uint64_t queued_rows = 0;
+    uint64_t dropped_rows = 0;
+
+    ~TrainerCsvLogWriter() {
+        Close();
     }
 
-    std::error_code ec;
-    const std::filesystem::path log_path(profile.log_path);
-    if (log_path.has_parent_path()) {
-        std::filesystem::create_directories(log_path.parent_path(), ec);
-        if (ec) {
+    bool Open(const TrainerProfile& profile) {
+        if (!profile.log_csv || profile.log_path.empty()) {
+            return false;
+        }
+
+        Close();
+        path = profile.log_path;
+        queued_rows = 0;
+        dropped_rows = 0;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            queue.clear();
+            stop_requested = false;
+        }
+
+        std::error_code ec;
+        const std::filesystem::path log_path(path);
+        if (log_path.has_parent_path()) {
+            std::filesystem::create_directories(log_path.parent_path(), ec);
+            if (ec) {
+                std::fprintf(stderr,
+                             "warning: could not create log directory '%s': %s\n",
+                             log_path.parent_path().string().c_str(),
+                             ec.message().c_str());
+            }
+        }
+
+        csv.open(log_path, std::ios::out | std::ios::trunc);
+        if (!csv) {
             std::fprintf(stderr,
-                         "warning: could not create log directory '%s': %s\n",
-                         log_path.parent_path().string().c_str(),
-                         ec.message().c_str());
+                         "warning: could not open CSV log '%s'. Continuing without CSV.\n",
+                         path.c_str());
+            return false;
+        }
+
+        csv << "time_s,frame,mouse_events,input_aux,keyboard_events,dx,dy,mouse_raw_dx,mouse_raw_dy,mouse_filtered_dx,mouse_filtered_dy,despike_count_10s,despike_count_total,left_dx,left_dy,left_yaw_raw,left_yaw_filtered,left_yaw_despike_count_10s,left_yaw_despike_count_total,left_yaw_position_model,left_yaw_adaptive_gain,left_yaw_gate_scale,left_yaw_gimbal_antiwindup_active,position_model,adaptive_gain,gate_scale,gimbal_antiwindup_active,roll_position,pitch_position,roll_velocity,pitch_velocity,roll,pitch,throttle,yaw,aim_x,aim_y,analog_throttle_up,analog_throttle_down,analog_yaw_left,analog_yaw_right,analog_cut,late_us\n";
+        open = true;
+        worker = std::thread([this]() {
+            WorkerLoop();
+        });
+        return true;
+    }
+
+    void Close() {
+        if (worker.joinable()) {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                stop_requested = true;
+            }
+            cv.notify_one();
+            worker.join();
+        }
+        if (csv.is_open()) {
+            csv.flush();
+            csv.close();
+        }
+        open = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            queue.clear();
+            stop_requested = false;
         }
     }
 
-    csv->open(log_path, std::ios::out | std::ios::trunc);
-    if (!*csv) {
-        std::fprintf(stderr,
-                     "warning: could not open CSV log '%s'. Continuing without CSV.\n",
-                     profile.log_path.c_str());
+    bool IsOpen() const {
+        return open;
+    }
+
+    uint64_t DroppedRows() const {
+        return dropped_rows;
+    }
+
+    void Enqueue(Row row) {
+        if (!open) {
+            return;
+        }
+
+        constexpr size_t kMaxQueuedRows = 65536;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (stop_requested || queue.size() >= kMaxQueuedRows) {
+                ++dropped_rows;
+                return;
+            }
+            queue.push_back(row);
+        }
+        ++queued_rows;
+        cv.notify_one();
+    }
+
+    void WorkerLoop() {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+
+        for (;;) {
+            std::deque<Row> local;
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                cv.wait(lock, [&]() {
+                    return stop_requested || !queue.empty();
+                });
+                local.swap(queue);
+                if (local.empty() && stop_requested) {
+                    break;
+                }
+            }
+
+            for (const Row& row : local) {
+                WriteRow(row);
+            }
+        }
+    }
+
+    void WriteRow(const Row& row) {
+        csv << row.time_s << ','
+            << row.frame << ','
+            << row.mouse_events << ','
+            << row.input_aux << ','
+            << row.keyboard_events << ','
+            << row.dx << ','
+            << row.dy << ','
+            << row.mouse_raw_dx << ','
+            << row.mouse_raw_dy << ','
+            << row.mouse_filtered_dx << ','
+            << row.mouse_filtered_dy << ','
+            << row.despike_recent_count << ','
+            << row.despike_total_count << ','
+            << row.left_dx << ','
+            << row.left_dy << ','
+            << row.left_yaw_raw << ','
+            << row.left_yaw_filtered << ','
+            << row.left_despike_recent_count << ','
+            << row.left_despike_total_count << ','
+            << PositionModelName(row.left_yaw_position_model) << ','
+            << row.left_yaw_adaptive_gain << ','
+            << row.left_yaw_gate_scale << ','
+            << (row.left_yaw_gimbal_antiwindup_active ? 1 : 0) << ','
+            << PositionModelName(row.position_model) << ','
+            << row.adaptive_gain << ','
+            << row.gate_scale << ','
+            << (row.gimbal_antiwindup_active ? 1 : 0) << ','
+            << row.roll_position << ','
+            << row.pitch_position << ','
+            << row.roll_velocity << ','
+            << row.pitch_velocity << ','
+            << row.roll << ','
+            << row.pitch << ','
+            << row.throttle << ','
+            << row.yaw << ','
+            << row.aim_x << ','
+            << row.aim_y << ','
+            << row.analog_throttle_up << ','
+            << row.analog_throttle_down << ','
+            << row.analog_yaw_left << ','
+            << row.analog_yaw_right << ','
+            << row.analog_cut << ','
+            << row.late_us << '\n';
+    }
+};
+
+constexpr int kRecordingSchemaVersion = 1;
+constexpr const char* kRecordingMagic = "gx12rec_csv";
+
+std::string TrimAscii(std::string value) {
+    size_t first = 0;
+    while (first < value.size() &&
+           (value[first] == ' ' || value[first] == '\t' ||
+            value[first] == '\r' || value[first] == '\n')) {
+        ++first;
+    }
+    size_t last = value.size();
+    while (last > first &&
+           (value[last - 1] == ' ' || value[last - 1] == '\t' ||
+            value[last - 1] == '\r' || value[last - 1] == '\n')) {
+        --last;
+    }
+    return value.substr(first, last - first);
+}
+
+std::vector<std::string> SplitSimpleCsvLine(const std::string& line) {
+    std::vector<std::string> fields;
+    size_t start = 0;
+    while (start <= line.size()) {
+        const size_t comma = line.find(',', start);
+        if (comma == std::string::npos) {
+            fields.push_back(line.substr(start));
+            break;
+        }
+        fields.push_back(line.substr(start, comma - start));
+        start = comma + 1;
+    }
+    return fields;
+}
+
+std::string MetadataValue(std::string value) {
+    for (char& ch : value) {
+        if (ch == '\r' || ch == '\n') {
+            ch = ' ';
+        }
+    }
+    return value;
+}
+
+std::string HexUint64(uint64_t value) {
+    std::ostringstream out;
+    out << std::uppercase << std::hex << std::setw(16) << std::setfill('0') << value;
+    return out.str();
+}
+
+std::string Fnv1aFileHashHex(const std::string& path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        return "";
+    }
+    uint64_t hash = 1469598103934665603ULL;
+    char buffer[4096];
+    while (file) {
+        file.read(buffer, sizeof(buffer));
+        const std::streamsize got = file.gcount();
+        for (std::streamsize i = 0; i < got; ++i) {
+            hash ^= static_cast<unsigned char>(buffer[i]);
+            hash *= 1099511628211ULL;
+        }
+    }
+    return HexUint64(hash);
+}
+
+int64_t UnixTimeMillisecondsNow() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+struct RecordingStartState {
+    bool right_mapper_available = false;
+    double right_roll_value = 0.0;
+    double right_pitch_value = 0.0;
+    double right_roll_velocity = 0.0;
+    double right_pitch_velocity = 0.0;
+    int right_roll_pulse = 0;
+    int right_pitch_pulse = 0;
+
+    bool mouse_left_available = false;
+    double mouse_left_throttle_value = 0.0;
+    double mouse_left_yaw_value = 0.0;
+    double mouse_left_yaw_filtered = 0.0;
+    double mouse_left_yaw_position = 0.0;
+    double mouse_left_yaw_dummy_position = 0.0;
+    double mouse_left_yaw_velocity = 0.0;
+    double mouse_left_yaw_dummy_velocity = 0.0;
+    int mouse_left_throttle_pulse = 0;
+    int mouse_left_yaw_pulse = 0;
+
+    bool right_mouse_left_available = false;
+    double right_mouse_left_throttle_value = 0.0;
+    double right_mouse_left_yaw_target = 0.0;
+    double right_mouse_left_yaw_output = 0.0;
+    int right_mouse_left_throttle_pulse = 0;
+    int right_mouse_left_yaw_pulse = 0;
+};
+
+struct RecordingCsvWriter;
+
+struct Gx12RecordingHidCapture {
+    bool hid_initialized = false;
+    bool available = false;
+    bool failed = false;
+    hid_device* device = nullptr;
+    int index = -1;
+    unsigned short vendor_id = 0;
+    unsigned short product_id = 0;
+    unsigned short usage_page = 0;
+    unsigned short usage = 0;
+    int interface_number = -1;
+    std::string product;
+    std::array<unsigned char, 64> buffer{};
+    Gx12DecodedReport last_report{};
+    bool last_valid = false;
+    int64_t last_elapsed_us = 0;
+    uint64_t reports = 0;
+    uint64_t decode_errors = 0;
+    uint64_t read_errors = 0;
+    std::string last_error;
+
+    bool Start();
+    void Poll(RecordingCsvWriter* writer, std::chrono::steady_clock::time_point start);
+    void Stop();
+};
+
+struct RecordingCsvWriter {
+    enum class RowKind {
+        Sample,
+        Hid
+    };
+
+    struct QueuedRow {
+        RowKind kind = RowKind::Sample;
+        int64_t time_us = 0;
+        uint32_t frame = 0;
+        uint32_t mapper_tick = 0;
+        uint64_t input_events = 0;
+        uint64_t input_aux = 0;
+        uint64_t keyboard_events = 0;
+        int64_t right_dx = 0;
+        int64_t right_dy = 0;
+        int64_t right_wheel_x = 0;
+        int64_t right_wheel_y = 0;
+        uint32_t right_buttons = 0;
+        int64_t left_dx = 0;
+        int64_t left_dy = 0;
+        int64_t left_wheel_x = 0;
+        int64_t left_wheel_y = 0;
+        uint32_t left_buttons = 0;
+        std::array<int, kSbusChannels> final_channels{};
+        uint64_t hid_reports = 0;
+        bool hid_valid = false;
+        uint32_t hid_buttons = 0;
+        std::array<int, kGx12ChannelCount> hid_channels{};
+        uint8_t trainer_flags = 0;
+        int64_t late_us = 0;
+    };
+
+    struct CommitSnapshot {
+        std::string path;
+        std::string selected_path;
+        std::vector<std::string> metadata_lines;
+        std::vector<QueuedRow> rows;
+        uint64_t sample_rows = 0;
+        uint64_t hid_rows = 0;
+        bool was_open = false;
+    };
+
+    struct CommitResult {
+        std::string path;
+        std::string selected_path;
+        uint64_t sample_rows = 0;
+        uint64_t hid_rows = 0;
+        bool attempted = false;
+        bool ok = true;
+        uintmax_t bytes = 0;
+        std::string error;
+    };
+
+    std::string path;
+    uint64_t sample_rows = 0;
+    uint64_t hid_rows = 0;
+    bool open = false;
+    bool last_commit_attempted = false;
+    bool last_commit_ok = false;
+    uintmax_t last_commit_bytes = 0;
+    std::string last_commit_error;
+    std::vector<std::string> metadata_lines;
+    std::vector<QueuedRow> buffered_rows;
+
+    ~RecordingCsvWriter() {
+        Close();
+    }
+
+    bool IsOpen() const {
+        return open;
+    }
+
+    static const char* RowKindName(RowKind kind) {
+        return kind == RowKind::Hid ? "hid" : "sample";
+    }
+
+    static void WriteQueuedRowToCsv(std::ofstream& csv, const QueuedRow& row) {
+        csv << RowKindName(row.kind) << ','
+            << row.time_us << ','
+            << row.frame << ','
+            << row.mapper_tick << ','
+            << row.input_events << ','
+            << row.input_aux << ','
+            << row.keyboard_events << ','
+            << row.right_dx << ','
+            << row.right_dy << ','
+            << row.right_wheel_x << ','
+            << row.right_wheel_y << ','
+            << row.right_buttons << ','
+            << row.left_dx << ','
+            << row.left_dy << ','
+            << row.left_wheel_x << ','
+            << row.left_wheel_y << ','
+            << row.left_buttons;
+        for (int ch = 0; ch < kSbusChannels; ++ch) {
+            csv << ',' << row.final_channels[static_cast<size_t>(ch)];
+        }
+        csv << ',' << row.hid_reports
+            << ',' << (row.hid_valid ? 1 : 0)
+            << ',' << row.hid_buttons;
+        for (int ch = 0; ch < kGx12ChannelCount; ++ch) {
+            csv << ',' << row.hid_channels[static_cast<size_t>(ch)];
+        }
+        csv << ',' << static_cast<unsigned int>(row.trainer_flags)
+            << ',' << row.late_us << '\n';
+    }
+
+    static bool SnapshotNeedsCommit(const CommitSnapshot& snapshot) {
+        return snapshot.was_open &&
+               (!snapshot.rows.empty() || snapshot.metadata_lines.size() > 1);
+    }
+
+    static CommitResult CommitSnapshotToDisk(CommitSnapshot snapshot) {
+        CommitResult result;
+        result.path = snapshot.path;
+        result.selected_path = snapshot.selected_path;
+        result.sample_rows = snapshot.sample_rows;
+        result.hid_rows = snapshot.hid_rows;
+
+        if (!SnapshotNeedsCommit(snapshot)) {
+            return result;
+        }
+
+        result.attempted = true;
+        std::ofstream csv(snapshot.path, std::ios::out | std::ios::trunc);
+        if (!csv) {
+            result.ok = false;
+            result.error = "open failed";
+            std::fprintf(stderr, "failed to write recording output: %s\n", snapshot.path.c_str());
+            return result;
+        }
+
+        for (const std::string& line : snapshot.metadata_lines) {
+            csv << line;
+        }
+        for (const QueuedRow& row : snapshot.rows) {
+            WriteQueuedRowToCsv(csv, row);
+        }
+        csv.flush();
+        if (!csv) {
+            result.ok = false;
+            result.error = "write/flush failed";
+            std::fprintf(stderr, "failed to flush recording output: %s\n", snapshot.path.c_str());
+        }
+        csv.close();
+        if (!csv) {
+            result.ok = false;
+            if (result.error.empty()) {
+                result.error = "close failed";
+            }
+            std::fprintf(stderr, "failed to close recording output: %s\n", snapshot.path.c_str());
+        }
+        if (result.ok) {
+            std::error_code ec;
+            result.bytes = std::filesystem::file_size(snapshot.path, ec);
+            if (ec) {
+                result.bytes = 0;
+            }
+        }
+        return result;
+    }
+
+    void ApplyCommitResult(const CommitResult& result) {
+        last_commit_attempted = result.attempted;
+        last_commit_ok = result.ok;
+        last_commit_bytes = result.bytes;
+        last_commit_error = result.error;
+    }
+
+    CommitSnapshot TakeCommitSnapshot() {
+        CommitSnapshot snapshot;
+        snapshot.path = path;
+        snapshot.metadata_lines = std::move(metadata_lines);
+        snapshot.rows = std::move(buffered_rows);
+        snapshot.sample_rows = sample_rows;
+        snapshot.hid_rows = hid_rows;
+        snapshot.was_open = open;
+
+        open = false;
+        metadata_lines.clear();
+        buffered_rows.clear();
+        return snapshot;
+    }
+
+    bool BufferRow(QueuedRow&& row) {
+        if (!open) {
+            return false;
+        }
+        buffered_rows.push_back(std::move(row));
+        return true;
+    }
+
+    bool BufferMetadata(std::string line) {
+        if (!open) {
+            return false;
+        }
+        metadata_lines.push_back(std::move(line));
+        return true;
+    }
+
+    void WriteStartState(const RecordingStartState& state) {
+        if (!open) {
+            return;
+        }
+
+        std::ostringstream metadata;
+        metadata << std::setprecision(17);
+        metadata << "# playback_start_right_mapper_state="
+                 << (state.right_mapper_available ? "true" : "false") << "\n";
+        if (state.right_mapper_available) {
+            metadata << "# playback_start_right_roll_value=" << state.right_roll_value << "\n";
+            metadata << "# playback_start_right_pitch_value=" << state.right_pitch_value << "\n";
+            metadata << "# playback_start_right_roll_velocity=" << state.right_roll_velocity << "\n";
+            metadata << "# playback_start_right_pitch_velocity=" << state.right_pitch_velocity << "\n";
+            metadata << "# playback_start_right_roll_pulse=" << state.right_roll_pulse << "\n";
+            metadata << "# playback_start_right_pitch_pulse=" << state.right_pitch_pulse << "\n";
+        }
+        metadata << "# playback_start_mouse_left_state="
+                 << (state.mouse_left_available ? "true" : "false") << "\n";
+        if (state.mouse_left_available) {
+            metadata << "# playback_start_mouse_left_throttle_value=" << state.mouse_left_throttle_value << "\n";
+            metadata << "# playback_start_mouse_left_yaw_value=" << state.mouse_left_yaw_value << "\n";
+            metadata << "# playback_start_mouse_left_yaw_filtered=" << state.mouse_left_yaw_filtered << "\n";
+            metadata << "# playback_start_mouse_left_yaw_position=" << state.mouse_left_yaw_position << "\n";
+            metadata << "# playback_start_mouse_left_yaw_dummy_position=" << state.mouse_left_yaw_dummy_position << "\n";
+            metadata << "# playback_start_mouse_left_yaw_velocity=" << state.mouse_left_yaw_velocity << "\n";
+            metadata << "# playback_start_mouse_left_yaw_dummy_velocity=" << state.mouse_left_yaw_dummy_velocity << "\n";
+            metadata << "# playback_start_mouse_left_throttle_pulse=" << state.mouse_left_throttle_pulse << "\n";
+            metadata << "# playback_start_mouse_left_yaw_pulse=" << state.mouse_left_yaw_pulse << "\n";
+        }
+        metadata << "# playback_start_right_mouse_left_state="
+                 << (state.right_mouse_left_available ? "true" : "false") << "\n";
+        if (state.right_mouse_left_available) {
+            metadata << "# playback_start_right_mouse_left_throttle_value=" << state.right_mouse_left_throttle_value << "\n";
+            metadata << "# playback_start_right_mouse_left_yaw_target=" << state.right_mouse_left_yaw_target << "\n";
+            metadata << "# playback_start_right_mouse_left_yaw_output=" << state.right_mouse_left_yaw_output << "\n";
+            metadata << "# playback_start_right_mouse_left_throttle_pulse=" << state.right_mouse_left_throttle_pulse << "\n";
+            metadata << "# playback_start_right_mouse_left_yaw_pulse=" << state.right_mouse_left_yaw_pulse << "\n";
+        }
+        BufferMetadata(metadata.str());
+    }
+
+    bool Open(const TrainerProfile& profile,
+              const char* recording_path,
+              int mapper_rate_hz,
+              const Gx12RecordingHidCapture& hid_capture) {
+        if (!recording_path || recording_path[0] == '\0') {
+            std::fprintf(stderr, "recording path must not be empty.\n");
+            return false;
+        }
+
+        Close();
+        sample_rows = 0;
+        hid_rows = 0;
+        last_commit_attempted = false;
+        last_commit_ok = false;
+        last_commit_bytes = 0;
+        last_commit_error.clear();
+        metadata_lines.clear();
+        buffered_rows.clear();
+        path = recording_path;
+        std::error_code ec;
+        const std::filesystem::path output_path(path);
+        if (output_path.has_parent_path()) {
+            std::filesystem::create_directories(output_path.parent_path(), ec);
+            if (ec) {
+                std::fprintf(stderr,
+                             "failed to create recording directory '%s': %s\n",
+                             output_path.parent_path().string().c_str(),
+                             ec.message().c_str());
+                return false;
+            }
+        }
+
+        std::ostringstream header;
+        header << "# " << kRecordingMagic << "=" << kRecordingSchemaVersion << "\n";
+        header << "# app_version=" << GX12_APP_VERSION << "\n";
+        header << "# created_unix_ms=" << UnixTimeMillisecondsNow() << "\n";
+        header << "# profile_name=" << MetadataValue(profile.name) << "\n";
+        header << "# profile_path=" << MetadataValue(profile.source_file) << "\n";
+        header << "# profile_fnv1a64=" << Fnv1aFileHashHex(profile.source_file) << "\n";
+        header << "# trainer_frame_rate_hz=" << profile.frame_rate_hz << "\n";
+        header << "# mapper_rate_hz=" << mapper_rate_hz << "\n";
+        header << "# trainer_resolution_mode=" << TrainerResolutionModeName(profile.resolution_mode) << "\n";
+        header << "# right_mouse_device_token=" << MetadataValue(profile.mouse_right_device_token) << "\n";
+        header << "# left_mouse_device_token=" << MetadataValue(profile.mouse_left_device_token) << "\n";
+        header << "# recording_buffer=memory\n";
+        header << "# hid_available=" << (hid_capture.available ? "true" : "false") << "\n";
+        if (hid_capture.available) {
+            header << "# hid_index=" << hid_capture.index << "\n";
+            header << "# hid_vid=0x" << std::uppercase << std::hex << std::setw(4) << std::setfill('0')
+                << hid_capture.vendor_id << "\n";
+            header << "# hid_pid=0x" << std::uppercase << std::hex << std::setw(4) << std::setfill('0')
+                << hid_capture.product_id << std::dec << std::setfill(' ') << "\n";
+            header << "# hid_usage=0x" << std::uppercase << std::hex << std::setw(4) << std::setfill('0')
+                << hid_capture.usage_page << ":0x" << std::setw(4) << hid_capture.usage
+                << std::dec << std::setfill(' ') << "\n";
+            header << "# hid_interface=" << hid_capture.interface_number << "\n";
+            header << "# hid_product=" << MetadataValue(hid_capture.product) << "\n";
+        }
+        header << "# playback_note=recordings store all available tracks; playback channel masks decide what is automated\n";
+
+        header << "row_type,time_us,frame,mapper_tick,input_events,input_aux,keyboard_events,"
+               "right_dx,right_dy,right_wheel_x,right_wheel_y,right_buttons,"
+               "left_dx,left_dy,left_wheel_x,left_wheel_y,left_buttons";
+        for (int ch = 0; ch < kSbusChannels; ++ch) {
+            header << ",final_ch" << (ch + 1);
+        }
+        header << ",hid_reports,hid_valid,hid_buttons";
+        for (int ch = 0; ch < kGx12ChannelCount; ++ch) {
+            header << ",hid_ch" << (ch + 1);
+        }
+        header << ",trainer_flags,late_us\n";
+        metadata_lines.push_back(header.str());
+        buffered_rows.reserve(static_cast<size_t>(
+            std::max(1024, profile.frame_rate_hz * std::max(1, profile.seconds > 0 ? profile.seconds : 30))));
+        open = true;
+        return true;
+    }
+
+    CommitSnapshot CloseToSnapshot() {
+        last_commit_attempted = false;
+        last_commit_ok = false;
+        last_commit_bytes = 0;
+        last_commit_error.clear();
+        return TakeCommitSnapshot();
+    }
+
+    bool Close() {
+        CommitResult result = CommitSnapshotToDisk(CloseToSnapshot());
+        ApplyCommitResult(result);
+        return result.ok;
+    }
+
+    void WriteRow(RowKind row_type,
+                  int64_t time_us,
+                  uint32_t frame,
+                  uint32_t mapper_tick,
+                  uint64_t input_events,
+                  uint64_t input_aux,
+                  uint64_t keyboard_events,
+                  int64_t right_dx,
+                  int64_t right_dy,
+                  int64_t right_wheel_x,
+                  int64_t right_wheel_y,
+                  uint32_t right_buttons,
+                  int64_t left_dx,
+                  int64_t left_dy,
+                  int64_t left_wheel_x,
+                  int64_t left_wheel_y,
+                  uint32_t left_buttons,
+                  const std::array<int, kSbusChannels>& final_channels,
+                  const Gx12DecodedReport* hid_report,
+                  bool hid_valid,
+                  uint64_t hid_reports,
+                  uint8_t trainer_flags,
+                  int64_t late_us) {
+        if (!open) {
+            return;
+        }
+
+        QueuedRow row;
+        row.kind = row_type;
+        row.time_us = time_us;
+        row.frame = frame;
+        row.mapper_tick = mapper_tick;
+        row.input_events = input_events;
+        row.input_aux = input_aux;
+        row.keyboard_events = keyboard_events;
+        row.right_dx = right_dx;
+        row.right_dy = right_dy;
+        row.right_wheel_x = right_wheel_x;
+        row.right_wheel_y = right_wheel_y;
+        row.right_buttons = right_buttons;
+        row.left_dx = left_dx;
+        row.left_dy = left_dy;
+        row.left_wheel_x = left_wheel_x;
+        row.left_wheel_y = left_wheel_y;
+        row.left_buttons = left_buttons;
+        row.final_channels = final_channels;
+        row.hid_reports = hid_reports;
+        row.hid_valid = hid_valid;
+        row.hid_buttons = hid_valid && hid_report ? hid_report->buttons : 0;
+        if (hid_valid && hid_report) {
+            for (int ch = 0; ch < kGx12ChannelCount; ++ch) {
+                row.hid_channels[static_cast<size_t>(ch)] = hid_report->channels[ch];
+            }
+        }
+        row.trainer_flags = trainer_flags;
+        row.late_us = late_us;
+
+        if (!BufferRow(std::move(row))) {
+            return;
+        }
+        if (row_type == RowKind::Sample) {
+            ++sample_rows;
+        } else {
+            ++hid_rows;
+        }
+    }
+
+    void WriteSample(int64_t time_us,
+                     uint32_t frame,
+                     uint32_t mapper_tick,
+                     uint64_t input_events,
+                     uint64_t input_aux,
+                     uint64_t keyboard_events,
+                     int64_t right_dx,
+                     int64_t right_dy,
+                     int64_t right_wheel_x,
+                     int64_t right_wheel_y,
+                     uint32_t right_buttons,
+                     int64_t left_dx,
+                     int64_t left_dy,
+                     int64_t left_wheel_x,
+                     int64_t left_wheel_y,
+                     uint32_t left_buttons,
+                     const std::array<int, kSbusChannels>& final_channels,
+                     const Gx12RecordingHidCapture& hid_capture,
+                     uint8_t trainer_flags,
+                     int64_t late_us) {
+        WriteRow(RowKind::Sample,
+                 time_us,
+                 frame,
+                 mapper_tick,
+                 input_events,
+                 input_aux,
+                 keyboard_events,
+                 right_dx,
+                 right_dy,
+                 right_wheel_x,
+                 right_wheel_y,
+                 right_buttons,
+                 left_dx,
+                 left_dy,
+                 left_wheel_x,
+                 left_wheel_y,
+                 left_buttons,
+                 final_channels,
+                 hid_capture.last_valid ? &hid_capture.last_report : nullptr,
+                 hid_capture.last_valid,
+                 hid_capture.reports,
+                 trainer_flags,
+                 late_us);
+    }
+
+    void WriteHidRow(int64_t time_us, uint64_t report_index, const Gx12DecodedReport& decoded) {
+        std::array<int, kSbusChannels> final_channels{};
+        WriteRow(RowKind::Hid,
+                 time_us,
+                 0,
+                 0,
+                 0,
+                 0,
+                 0,
+                 0,
+                 0,
+                 0,
+                 0,
+                 0,
+                 0,
+                 0,
+                 0,
+                 0,
+                 0,
+                 final_channels,
+                 &decoded,
+                 true,
+                 report_index,
+                 0,
+                 0);
+    }
+};
+
+struct RecordingCommitQueue {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<RecordingCsvWriter::CommitSnapshot> pending;
+    std::deque<RecordingCsvWriter::CommitResult> completed;
+    std::thread worker;
+    bool stop_requested = false;
+
+    ~RecordingCommitQueue() {
+        Stop();
+    }
+
+    void Start() {
+        if (worker.joinable()) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stop_requested = false;
+        }
+        worker = std::thread([this]() {
+            WorkerLoop();
+        });
+    }
+
+    void Enqueue(RecordingCsvWriter::CommitSnapshot snapshot) {
+        if (!snapshot.was_open) {
+            return;
+        }
+        Start();
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            pending.push_back(std::move(snapshot));
+        }
+        cv.notify_one();
+    }
+
+    std::vector<RecordingCsvWriter::CommitResult> DrainCompleted() {
+        std::vector<RecordingCsvWriter::CommitResult> results;
+        std::lock_guard<std::mutex> lock(mutex);
+        while (!completed.empty()) {
+            results.push_back(std::move(completed.front()));
+            completed.pop_front();
+        }
+        return results;
+    }
+
+    void Stop() {
+        if (!worker.joinable()) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stop_requested = true;
+        }
+        cv.notify_one();
+        worker.join();
+    }
+
+    void WorkerLoop() {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+
+        for (;;) {
+            RecordingCsvWriter::CommitSnapshot snapshot;
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                cv.wait(lock, [&]() {
+                    return stop_requested || !pending.empty();
+                });
+                if (pending.empty() && stop_requested) {
+                    break;
+                }
+                snapshot = std::move(pending.front());
+                pending.pop_front();
+            }
+
+            RecordingCsvWriter::CommitResult result =
+                RecordingCsvWriter::CommitSnapshotToDisk(std::move(snapshot));
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                completed.push_back(std::move(result));
+            }
+        }
+    }
+};
+
+bool Gx12RecordingHidCapture::Start() {
+    if (hid_init() != 0) {
+        last_error = HidErrorUtf8(nullptr);
+        return false;
+    }
+    hid_initialized = true;
+
+    const std::vector<HidDeviceEntry> devices = EnumerateHidDevices();
+    const HidDeviceEntry* selected = FindGx12Hid(devices);
+    if (!selected) {
+        last_error = "GX12 joystick HID not found";
+        Stop();
         return false;
     }
 
-    *csv << "time_s,frame,mouse_events,input_aux,keyboard_events,dx,dy,mouse_raw_dx,mouse_raw_dy,mouse_filtered_dx,mouse_filtered_dy,despike_count_10s,despike_count_total,left_dx,left_dy,left_yaw_raw,left_yaw_filtered,left_yaw_despike_count_10s,left_yaw_despike_count_total,left_yaw_position_model,left_yaw_adaptive_gain,left_yaw_gate_scale,left_yaw_gimbal_antiwindup_active,position_model,adaptive_gain,gate_scale,gimbal_antiwindup_active,roll_position,pitch_position,roll_velocity,pitch_velocity,roll,pitch,throttle,yaw,aim_x,aim_y,analog_throttle_up,analog_throttle_down,analog_yaw_left,analog_yaw_right,analog_cut,late_us\n";
+    device = hid_open_path(selected->path.c_str());
+    if (!device) {
+        last_error = HidErrorUtf8(nullptr);
+        Stop();
+        return false;
+    }
+    if (hid_set_nonblocking(device, 1) != 0) {
+        last_error = HidErrorUtf8(device);
+        Stop();
+        return false;
+    }
+
+    available = true;
+    index = selected->index;
+    vendor_id = selected->vendor_id;
+    product_id = selected->product_id;
+    usage_page = selected->usage_page;
+    usage = selected->usage;
+    interface_number = selected->interface_number;
+    product = selected->product;
     return true;
 }
 
-int RunTrainerProfile(const TrainerProfile& initial_profile, bool guided, bool live_reload) {
+void Gx12RecordingHidCapture::Poll(RecordingCsvWriter* writer,
+                                   std::chrono::steady_clock::time_point start) {
+    if (!available || !device || failed) {
+        return;
+    }
+
+    for (int drained = 0; drained < 16; ++drained) {
+        const int read = hid_read_timeout(device, buffer.data(), buffer.size(), 0);
+        const auto now = std::chrono::steady_clock::now();
+        if (read > 0) {
+            Gx12DecodedReport decoded{};
+            if (!DecodeGx12Report(buffer.data(), read, &decoded)) {
+                ++decode_errors;
+                continue;
+            }
+            ++reports;
+            last_report = decoded;
+            last_valid = true;
+            last_elapsed_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(now - start).count();
+            if (writer) {
+                writer->WriteHidRow(last_elapsed_us, reports, decoded);
+            }
+            continue;
+        }
+        if (read == 0) {
+            break;
+        }
+
+        ++read_errors;
+        last_error = HidReadErrorUtf8(device);
+        failed = true;
+        break;
+    }
+}
+
+void Gx12RecordingHidCapture::Stop() {
+    if (device) {
+        hid_close(device);
+        device = nullptr;
+    }
+    if (hid_initialized) {
+        hid_exit();
+        hid_initialized = false;
+    }
+    available = false;
+}
+
+struct RecordingMetadata {
+    int schema = 0;
+    std::string app_version;
+    std::string profile_name;
+    std::string profile_path;
+    std::string profile_hash;
+    std::string recording_buffer = "unknown";
+    int trainer_frame_rate_hz = 0;
+    int mapper_rate_hz = 0;
+    TrainerResolutionMode resolution_mode = TrainerResolutionMode::Legacy;
+    bool hid_available_header = false;
+    RecordingStartState start_state;
+};
+
+struct RecordingSample {
+    int64_t time_us = 0;
+    uint32_t frame = 0;
+    uint32_t mapper_tick = 0;
+    int64_t right_dx = 0;
+    int64_t right_dy = 0;
+    int64_t right_wheel_x = 0;
+    int64_t right_wheel_y = 0;
+    uint32_t right_buttons = 0;
+    int64_t left_dx = 0;
+    int64_t left_dy = 0;
+    int64_t left_wheel_x = 0;
+    int64_t left_wheel_y = 0;
+    uint32_t left_buttons = 0;
+    std::array<int, kSbusChannels> final_channels{};
+    std::array<int, kGx12ChannelCount> hid_channels{};
+    bool hid_valid = false;
+    uint64_t hid_reports = 0;
+    uint32_t hid_buttons = 0;
+    uint8_t trainer_flags = 0;
+    int64_t late_us = 0;
+};
+
+struct LoadedRecording {
+    RecordingMetadata metadata;
+    std::vector<RecordingSample> samples;
+    uint64_t hid_rows = 0;
+    bool has_hid_samples = false;
+};
+
+struct PlaybackChannelMask {
+    std::array<bool, kSbusChannels> enabled{};
+    std::array<bool, kSbusChannels> use_hid{};
+    std::array<bool, kSbusChannels> use_pc_input{};
+
+    bool Any() const {
+        return std::any_of(enabled.begin(), enabled.end(), [](bool value) { return value; });
+    }
+
+    bool UsesRightStick() const {
+        return enabled[0] || enabled[1];
+    }
+
+    bool UsesLeftStick() const {
+        return enabled[2] || enabled[3];
+    }
+
+    bool UsesThrottleOrYaw() const {
+        return enabled[2] || enabled[3];
+    }
+
+    bool UsesHidRightStick() const {
+        return (enabled[0] && use_hid[0]) || (enabled[1] && use_hid[1]);
+    }
+};
+
+struct PlaybackTrigger {
+    int virtual_key = 0;
+    std::string label = "immediate";
+
+    bool Immediate() const {
+        return virtual_key == 0;
+    }
+};
+
+constexpr size_t kMaxPlaybackBankSlots = 12;
+
+struct PlaybackBankSlotSpec {
+    std::string recording_path;
+    PlaybackChannelMask mask;
+    PlaybackTrigger trigger;
+    bool block_live_input = false;
+};
+
+struct PlaybackBankSlot {
+    PlaybackBankSlotSpec spec;
+    LoadedRecording recording;
+    std::vector<size_t> mapper_tick_sample_indices;
+    bool loaded = false;
+};
+
+struct PlaybackInputInjection {
+    int64_t right_dx = 0;
+    int64_t right_dy = 0;
+    int64_t right_wheel_x = 0;
+    int64_t right_wheel_y = 0;
+    uint32_t right_buttons = 0;
+    bool right_buttons_valid = false;
+    int64_t left_dx = 0;
+    int64_t left_dy = 0;
+    int64_t left_wheel_x = 0;
+    int64_t left_wheel_y = 0;
+    uint32_t left_buttons = 0;
+    bool left_buttons_valid = false;
+    uint32_t mapper_ticks = 0;
+
+    bool Any() const {
+        return mapper_ticks > 0 ||
+               right_dx != 0 ||
+               right_dy != 0 ||
+               right_wheel_x != 0 ||
+               right_wheel_y != 0 ||
+               right_buttons_valid ||
+               left_dx != 0 ||
+               left_dy != 0 ||
+               left_wheel_x != 0 ||
+               left_wheel_y != 0 ||
+               left_buttons_valid;
+    }
+};
+
+struct RightStickPlaybackState {
+    double roll_value = 0.0;
+    double pitch_value = 0.0;
+    ElasticAxisState roll_elastic_state;
+    ElasticAxisState pitch_elastic_state;
+    RightStickSharedState shared_state;
+    int roll_pulse = 0;
+    int pitch_pulse = 0;
+    uint32_t idle_ticks_without_motion = 0;
+};
+
+RightStickPlaybackState MakeRightStickPlaybackStateFromRecording(
+    const RecordingStartState& start_state) {
+    RightStickPlaybackState state;
+    if (!start_state.right_mapper_available) {
+        return state;
+    }
+    state.roll_value = start_state.right_roll_value;
+    state.pitch_value = start_state.right_pitch_value;
+    state.roll_elastic_state.velocity = start_state.right_roll_velocity;
+    state.pitch_elastic_state.velocity = start_state.right_pitch_velocity;
+    state.roll_pulse = start_state.right_roll_pulse;
+    state.pitch_pulse = start_state.right_pitch_pulse;
+    return state;
+}
+
+RecordingStartState MakeRecordingStartStateFromRightStick(
+    double roll_value,
+    double pitch_value,
+    const ElasticAxisState& roll_elastic_state,
+    const ElasticAxisState& pitch_elastic_state,
+    int roll_pulse,
+    int pitch_pulse) {
+    RecordingStartState state;
+    state.right_mapper_available = true;
+    state.right_roll_value = roll_value;
+    state.right_pitch_value = pitch_value;
+    state.right_roll_velocity = roll_elastic_state.velocity;
+    state.right_pitch_velocity = pitch_elastic_state.velocity;
+    state.right_roll_pulse = roll_pulse;
+    state.right_pitch_pulse = pitch_pulse;
+    return state;
+}
+
+void StepRightStickPlaybackState(const TrainerProfile& profile,
+                                 int64_t dx,
+                                 int64_t dy,
+                                 int mapper_rate_hz,
+                                 RightStickPlaybackState* state) {
+    if (!state || mapper_rate_hz <= 0) {
+        return;
+    }
+
+    const double mapper_dt = 1.0 / static_cast<double>(mapper_rate_hz);
+    const double gain_scale = TrainerRateGainScale(mapper_rate_hz);
+    const double roll_source = profile.swap_axes
+        ? static_cast<double>(-dy)
+        : static_cast<double>(dx);
+    const double pitch_source = profile.swap_axes
+        ? static_cast<double>(dx)
+        : static_cast<double>(-dy);
+    const bool use_position_mapper = RightStickNeedsPositionMapper(profile);
+    if (use_position_mapper) {
+        const bool mouse_moved = dx != 0 || dy != 0;
+        if (mouse_moved) {
+            state->idle_ticks_without_motion = 0;
+        } else if (state->idle_ticks_without_motion < std::numeric_limits<uint32_t>::max()) {
+            ++state->idle_ticks_without_motion;
+        }
+        const double idle_ms =
+            static_cast<double>(state->idle_ticks_without_motion) *
+            1000.0 /
+            static_cast<double>(mapper_rate_hz);
+        const bool apply_idle_return =
+            profile.return_enabled &&
+            profile.return_rate > 0.0 &&
+            !mouse_moved &&
+            (profile.return_idle_ms <= 0.0 || idle_ms >= profile.return_idle_ms);
+        const double combined_return_step =
+            (apply_idle_return
+                 ? profile.return_rate / static_cast<double>(mapper_rate_hz)
+                 : 0.0) +
+            (profile.constant_return_enabled
+                 ? profile.constant_return_rate / static_cast<double>(mapper_rate_hz)
+                 : 0.0);
+        const double elastic_return_coefficient =
+            profile.elastic_return_enabled
+                ? profile.elastic_return_coefficient
+                : 0.0;
+        ShapeRightStickPositionPulses(roll_source,
+                                      pitch_source,
+                                      gain_scale,
+                                      combined_return_step,
+                                      elastic_return_coefficient,
+                                      mapper_dt,
+                                      combined_return_step > 0.0 ||
+                                          elastic_return_coefficient > 0.0,
+                                      &state->roll_value,
+                                      &state->pitch_value,
+                                      &state->roll_elastic_state,
+                                      &state->pitch_elastic_state,
+                                      &state->shared_state,
+                                      profile,
+                                      &state->roll_pulse,
+                                      &state->pitch_pulse);
+    } else {
+        double filtered_roll_source = roll_source;
+        double filtered_pitch_source = pitch_source;
+        ApplyRightStickInputPreprocessors(&filtered_roll_source,
+                                          &filtered_pitch_source,
+                                          mapper_dt,
+                                          profile,
+                                          &state->shared_state);
+        const double input_gain = UpdateAdaptiveInputGain(filtered_roll_source,
+                                                          filtered_pitch_source,
+                                                          mapper_dt,
+                                                          profile,
+                                                          &state->shared_state);
+        state->roll_pulse = ShapeTrainerPulse(filtered_roll_source,
+                                              profile.roll_gain * gain_scale * input_gain,
+                                              profile.invert_roll,
+                                              &state->roll_value,
+                                              profile);
+        state->pitch_pulse = ShapeTrainerPulse(filtered_pitch_source,
+                                               profile.pitch_gain * gain_scale * input_gain,
+                                               profile.invert_pitch,
+                                               &state->pitch_value,
+                                               profile);
+    }
+}
+
+struct LeftStickPlaybackState {
+    double throttle_value = 0.0;
+    double mouse_left_yaw_value = 0.0;
+    double mouse_left_yaw_filtered = 0.0;
+    double mouse_left_yaw_position = 0.0;
+    double mouse_left_yaw_dummy_position = 0.0;
+    ElasticAxisState mouse_left_yaw_elastic_state;
+    ElasticAxisState mouse_left_yaw_dummy_state;
+    RightStickSharedState mouse_left_yaw_mapper_state;
+    uint32_t mouse_left_idle_ticks_without_motion = 0;
+    double right_mouse_left_yaw_target = 0.0;
+    double right_mouse_left_yaw_output = 0.0;
+    int throttle_pulse = 0;
+    int yaw_pulse = 0;
+};
+
+LeftStickPlaybackState MakeLeftStickPlaybackStateFromRecording(
+    const TrainerProfile& profile,
+    const RecordingStartState& start_state) {
+    LeftStickPlaybackState state;
+    state.throttle_value = static_cast<double>(TrainerProfileLowValue());
+    state.throttle_pulse = QuantizeTrainerProfileOutput(
+        state.throttle_value,
+        profile.resolution_mode);
+    state.yaw_pulse = 0;
+
+    if (profile.mouse_left.enabled && start_state.mouse_left_available) {
+        state.throttle_value = start_state.mouse_left_throttle_value;
+        state.mouse_left_yaw_value = start_state.mouse_left_yaw_value;
+        state.mouse_left_yaw_filtered = start_state.mouse_left_yaw_filtered;
+        state.mouse_left_yaw_position = start_state.mouse_left_yaw_position;
+        state.mouse_left_yaw_dummy_position = start_state.mouse_left_yaw_dummy_position;
+        state.mouse_left_yaw_elastic_state.velocity =
+            start_state.mouse_left_yaw_velocity;
+        state.mouse_left_yaw_dummy_state.velocity =
+            start_state.mouse_left_yaw_dummy_velocity;
+        state.throttle_pulse = start_state.mouse_left_throttle_pulse;
+        state.yaw_pulse = start_state.mouse_left_yaw_pulse;
+    } else if (profile.right_mouse_left.enabled &&
+               start_state.right_mouse_left_available) {
+        state.throttle_value = start_state.right_mouse_left_throttle_value;
+        state.right_mouse_left_yaw_target =
+            start_state.right_mouse_left_yaw_target;
+        state.right_mouse_left_yaw_output =
+            start_state.right_mouse_left_yaw_output;
+        state.throttle_pulse = start_state.right_mouse_left_throttle_pulse;
+        state.yaw_pulse = start_state.right_mouse_left_yaw_pulse;
+    }
+    return state;
+}
+
+void StepLeftStickPlaybackState(const TrainerProfile& profile,
+                                const PlaybackInputInjection& injection,
+                                int mapper_rate_hz,
+                                LeftStickPlaybackState* state) {
+    if (!state || mapper_rate_hz <= 0) {
+        return;
+    }
+
+    const double mapper_dt = 1.0 / static_cast<double>(mapper_rate_hz);
+    const double gain_scale = TrainerRateGainScale(mapper_rate_hz);
+
+    if (profile.mouse_left.enabled) {
+        const double throttle_source = profile.mouse_left.swap_axes
+            ? static_cast<double>(injection.left_dx)
+            : static_cast<double>(-injection.left_dy);
+        double throttle_axis = throttle_source;
+        if (profile.mouse_left.invert_throttle) {
+            throttle_axis = -throttle_axis;
+        }
+        state->throttle_value = ClampDouble(
+            state->throttle_value + throttle_axis * profile.mouse_left.throttle_rate,
+            static_cast<double>(TrainerProfileLowValue()),
+            static_cast<double>(kTrainerProfileDomainLimit));
+        if (profile.mouse_left.throttle_return_enabled &&
+            std::abs(throttle_axis) < 0.001) {
+            state->throttle_value = MoveTowardDouble(
+                state->throttle_value,
+                static_cast<double>(TrainerProfileLowValue()),
+                profile.mouse_left.throttle_return_rate * mapper_dt);
+        }
+        state->throttle_pulse = QuantizeTrainerProfileOutput(
+            state->throttle_value,
+            profile.resolution_mode);
+
+        const double raw_yaw_source = profile.mouse_left.swap_axes
+            ? static_cast<double>(injection.left_dy)
+            : static_cast<double>(injection.left_dx);
+        double yaw_source = raw_yaw_source;
+        if (!profile.mouse_left.yaw_shaping_enabled &&
+            profile.mouse_left.invert_yaw) {
+            yaw_source = -yaw_source;
+        }
+        const bool left_yaw_moved = std::abs(raw_yaw_source) > 0.001;
+        if (left_yaw_moved) {
+            state->mouse_left_idle_ticks_without_motion = 0;
+        } else if (state->mouse_left_idle_ticks_without_motion <
+                   std::numeric_limits<uint32_t>::max()) {
+            ++state->mouse_left_idle_ticks_without_motion;
+        }
+        const double idle_ms =
+            static_cast<double>(state->mouse_left_idle_ticks_without_motion) *
+            1000.0 /
+            static_cast<double>(mapper_rate_hz);
+
+        if (profile.mouse_left.yaw_shaping_enabled) {
+            const bool apply_left_yaw_idle_return =
+                profile.mouse_left.yaw_return_enabled &&
+                profile.mouse_left.yaw_return_rate > 0.0 &&
+                !left_yaw_moved &&
+                (profile.mouse_left.yaw_return_idle_ms <= 0.0 ||
+                 idle_ms >= profile.mouse_left.yaw_return_idle_ms);
+            const double combined_return_step =
+                (apply_left_yaw_idle_return
+                     ? profile.mouse_left.yaw_return_rate /
+                           static_cast<double>(mapper_rate_hz)
+                     : 0.0) +
+                (profile.mouse_left.yaw_constant_return_enabled
+                     ? profile.mouse_left.yaw_constant_return_rate /
+                           static_cast<double>(mapper_rate_hz)
+                     : 0.0);
+            const double elastic_return_coefficient =
+                profile.mouse_left.yaw_elastic_return_enabled
+                    ? profile.mouse_left.yaw_elastic_return_coefficient
+                    : 0.0;
+            state->yaw_pulse = ShapeMouseLeftYawWithMapper(
+                raw_yaw_source,
+                gain_scale,
+                combined_return_step,
+                elastic_return_coefficient,
+                mapper_dt,
+                combined_return_step > 0.0 ||
+                    elastic_return_coefficient > 0.0,
+                &state->mouse_left_yaw_position,
+                &state->mouse_left_yaw_dummy_position,
+                &state->mouse_left_yaw_elastic_state,
+                &state->mouse_left_yaw_dummy_state,
+                &state->mouse_left_yaw_mapper_state,
+                profile,
+                &state->mouse_left_yaw_filtered);
+            state->mouse_left_yaw_value = state->mouse_left_yaw_position;
+        } else {
+            state->mouse_left_yaw_value = ClampDouble(
+                state->mouse_left_yaw_value +
+                    yaw_source * profile.mouse_left.yaw_gain,
+                -static_cast<double>(profile.mouse_left.yaw_pulse),
+                static_cast<double>(profile.mouse_left.yaw_pulse));
+            if (std::abs(state->mouse_left_yaw_value) <=
+                static_cast<double>(profile.mouse_left.yaw_deadband)) {
+                state->mouse_left_yaw_value = 0.0;
+            }
+            const bool apply_left_yaw_idle_return =
+                profile.mouse_left.yaw_return_enabled &&
+                profile.mouse_left.yaw_return_rate > 0.0 &&
+                !left_yaw_moved &&
+                (profile.mouse_left.yaw_return_idle_ms <= 0.0 ||
+                 idle_ms >= profile.mouse_left.yaw_return_idle_ms);
+            double left_yaw_return_step =
+                (apply_left_yaw_idle_return
+                     ? profile.mouse_left.yaw_return_rate * mapper_dt
+                     : 0.0) +
+                (profile.mouse_left.yaw_constant_return_enabled
+                     ? profile.mouse_left.yaw_constant_return_rate * mapper_dt
+                     : 0.0);
+            if (profile.mouse_left.yaw_elastic_return_enabled) {
+                left_yaw_return_step +=
+                    ElasticReturnRatePerSecond(
+                        std::abs(state->mouse_left_yaw_value),
+                        profile.mouse_left.yaw_pulse,
+                        profile.mouse_left.yaw_elastic_return_coefficient,
+                        profile.mouse_left.yaw_elastic_return_mode,
+                        profile.mouse_left.yaw_elastic_return_curve) *
+                    mapper_dt;
+            }
+            if (left_yaw_return_step > 0.0) {
+                state->mouse_left_yaw_value = MoveTowardDouble(
+                    state->mouse_left_yaw_value,
+                    0.0,
+                    left_yaw_return_step);
+            }
+            double yaw_target = state->mouse_left_yaw_value;
+            if (profile.mouse_left.yaw_smoothing > 0.0) {
+                yaw_target =
+                    (profile.mouse_left.yaw_smoothing *
+                     state->mouse_left_yaw_filtered) +
+                    ((1.0 - profile.mouse_left.yaw_smoothing) * yaw_target);
+            }
+            const double yaw_output = profile.mouse_left.yaw_slew_rate <= 0.0
+                ? yaw_target
+                : MoveTowardDouble(state->mouse_left_yaw_filtered,
+                                   yaw_target,
+                                   profile.mouse_left.yaw_slew_rate * mapper_dt);
+            state->mouse_left_yaw_filtered = yaw_output;
+            state->yaw_pulse = QuantizeTrainerProfileOutput(
+                yaw_output,
+                profile.resolution_mode);
+        }
+        return;
+    }
+
+    if (profile.right_mouse_left.enabled) {
+        const auto& source = profile.right_mouse_left;
+#if defined(GX12_HAS_GAMEINPUT)
+        const double wheel_axis_raw =
+            NormalizeGameInputWheelDelta(injection.right_wheel_y);
+        const uint32_t buttons =
+            injection.right_buttons_valid ? injection.right_buttons : 0;
+        const double button_axis_raw =
+            static_cast<double>(GameInputMouse4Mouse5Axis(buttons));
+#else
+        const double wheel_axis_raw = 0.0;
+        const double button_axis_raw = 0.0;
+#endif
+
+        if (source.swap_axes) {
+            double throttle_axis = button_axis_raw;
+            if (source.invert_throttle) {
+                throttle_axis = -throttle_axis;
+            }
+            state->throttle_value = ClampDouble(
+                state->throttle_value +
+                    throttle_axis * source.throttle_button_rate * mapper_dt,
+                static_cast<double>(TrainerProfileLowValue()),
+                static_cast<double>(kTrainerProfileDomainLimit));
+            if (source.throttle_return_enabled &&
+                std::abs(throttle_axis) < 0.001) {
+                state->throttle_value = MoveTowardDouble(
+                    state->throttle_value,
+                    static_cast<double>(TrainerProfileLowValue()),
+                    source.throttle_return_rate * mapper_dt);
+            }
+
+            double yaw_wheel_axis = wheel_axis_raw;
+            if (source.invert_yaw) {
+                yaw_wheel_axis = -yaw_wheel_axis;
+            }
+            if (std::abs(yaw_wheel_axis) > 0.001) {
+                state->right_mouse_left_yaw_target =
+                    ClampDouble(state->right_mouse_left_yaw_target +
+                                    yaw_wheel_axis * source.yaw_scroll_step,
+                                -static_cast<double>(source.yaw_pulse),
+                                static_cast<double>(source.yaw_pulse));
+            }
+        } else {
+            double throttle_wheel_axis = wheel_axis_raw;
+            if (source.invert_throttle) {
+                throttle_wheel_axis = -throttle_wheel_axis;
+            }
+            if (std::abs(throttle_wheel_axis) > 0.001) {
+                state->throttle_value =
+                    ClampDouble(state->throttle_value +
+                                    throttle_wheel_axis * source.throttle_step,
+                                static_cast<double>(TrainerProfileLowValue()),
+                                static_cast<double>(kTrainerProfileDomainLimit));
+            } else if (source.throttle_return_enabled) {
+                state->throttle_value = MoveTowardDouble(
+                    state->throttle_value,
+                    static_cast<double>(TrainerProfileLowValue()),
+                    source.throttle_return_rate * mapper_dt);
+            }
+
+            double yaw_button_axis = button_axis_raw;
+            if (source.invert_yaw) {
+                yaw_button_axis = -yaw_button_axis;
+            }
+            state->right_mouse_left_yaw_target =
+                yaw_button_axis * static_cast<double>(source.yaw_pulse);
+        }
+
+        state->throttle_pulse = QuantizeTrainerProfileOutput(
+            state->throttle_value,
+            profile.resolution_mode);
+        state->right_mouse_left_yaw_output = source.yaw_slew_rate <= 0.0
+            ? state->right_mouse_left_yaw_target
+            : MoveTowardDouble(state->right_mouse_left_yaw_output,
+                               state->right_mouse_left_yaw_target,
+                               source.yaw_slew_rate * mapper_dt);
+        state->yaw_pulse = QuantizeTrainerProfileOutput(
+            state->right_mouse_left_yaw_output,
+            profile.resolution_mode);
+    }
+}
+
+bool LoadRecordingFile(const char* path, LoadedRecording* recording, std::string* error);
+bool ValidatePlaybackRecordingForCurrentBuild(const LoadedRecording& recording,
+                                              const char* recording_path);
+int ParseTriggerVirtualKeyName(const std::string& text);
+bool ParsePlaybackTrigger(const std::string& text, PlaybackTrigger* trigger);
+bool ParsePlaybackChannelMask(const std::string& text, PlaybackChannelMask* mask);
+bool PlaybackTriggerPressed(const PlaybackTrigger& trigger);
+std::vector<size_t> BuildPlaybackMapperTickSampleIndices(const LoadedRecording& recording);
+bool PlaybackMaskUsesOnlyRecordedOverlay(const PlaybackChannelMask& mask);
+int PlaybackFramesPerRecordedMapperTick(const TrainerProfile& profile,
+                                        const LoadedRecording& recording);
+uint8_t PlaybackActiveFlags(const PlaybackChannelMask& mask, TrainerResolutionMode mode);
+bool ResolveIntegratedPlaybackMaskForProfile(PlaybackChannelMask* mask,
+                                             const TrainerProfile& profile,
+                                             const LoadedRecording& recording,
+                                             const std::string& recording_path,
+                                             bool verbose);
+std::array<int, kSbusChannels> BuildPlaybackPulses(const RecordingSample& sample,
+                                                   const PlaybackChannelMask& mask,
+                                                   TrainerResolutionMode mode);
+std::string DescribePlaybackChannelMask(const PlaybackChannelMask& mask);
+bool PlaybackMaskAllEnabledChannelsUseInputInjection(const PlaybackChannelMask& mask,
+                                                     const TrainerProfile& profile);
+PlaybackInputInjection ConsumePlaybackInputInjection(const PlaybackBankSlot& slot,
+                                                     const TrainerProfile& profile,
+                                                     int64_t playback_elapsed_us,
+                                                     int64_t playback_base_us,
+                                                     size_t* sample_index,
+                                                     bool* have_mapper_tick,
+                                                     uint32_t* last_mapper_tick);
+void ApplyPlaybackInputInjection(const PlaybackInputInjection& injection,
+                                 int64_t* right_dx,
+                                 int64_t* right_dy,
+                                 int64_t* right_wheel_x,
+                                 int64_t* right_wheel_y,
+                                 uint32_t* right_buttons,
+                                 int64_t* left_dx,
+                                 int64_t* left_dy,
+                                 int64_t* left_wheel_x,
+                                 int64_t* left_wheel_y,
+                                 uint32_t* left_buttons);
+void ClearPlaybackLiveInputForMask(const PlaybackBankSlotSpec& spec,
+                                   const TrainerProfile& profile,
+                                   int64_t* right_dx,
+                                   int64_t* right_dy,
+                                   int64_t* right_wheel_y,
+                                   uint32_t* right_buttons,
+                                   int64_t* left_dx,
+                                   int64_t* left_dy);
+bool PlaybackChannelUsesInputInjection(const PlaybackChannelMask& mask,
+                                       const TrainerProfile& profile,
+                                       int channel_index);
+
+struct TrainerRecordingOptions {
+    std::string path;
+    bool start_immediately = false;
+    bool overwrite_existing = false;
+    int toggle_key_vk = 0;
+    std::string toggle_key_label;
+    int max_seconds = 0;
+
+    bool Enabled() const {
+        return !path.empty();
+    }
+
+    bool ToggleMode() const {
+        return Enabled() && toggle_key_vk > 0;
+    }
+};
+
+struct TrainerRuntimeControlOptions {
+    std::string path;
+
+    bool Enabled() const {
+        return !path.empty();
+    }
+};
+
+struct TrainerPlaybackBankOptions {
+    bool loop = false;
+    std::vector<PlaybackBankSlotSpec> specs;
+
+    bool Enabled() const {
+        return !specs.empty();
+    }
+};
+
+struct TrainerRuntimeControlSnapshot {
+    TrainerRecordingOptions recording;
+    TrainerPlaybackBankOptions playback_bank;
+};
+
+bool RecordingToggleKeyDown(const TrainerRecordingOptions& options) {
+    if (options.toggle_key_vk <= 0) {
+        return false;
+    }
+    return AnyExpandedKeyDown(options.toggle_key_vk, [](int vk) {
+        return vk > 0 && (GetAsyncKeyState(vk) & 0x8000) != 0;
+    });
+}
+
+std::vector<std::string> SplitTabLine(const std::string& line) {
+    std::vector<std::string> fields;
+    size_t start = 0;
+    while (start <= line.size()) {
+        const size_t tab = line.find('\t', start);
+        if (tab == std::string::npos) {
+            fields.push_back(line.substr(start));
+            break;
+        }
+        fields.push_back(line.substr(start, tab - start));
+        start = tab + 1;
+    }
+    return fields;
+}
+
+bool ParseRuntimeControlBool(const std::string& text, bool* value) {
+    if (!value) {
+        return false;
+    }
+    const std::string lowered = ToLowerAscii(TrimAscii(text));
+    if (lowered == "1" || lowered == "true" || lowered == "yes" || lowered == "on") {
+        *value = true;
+        return true;
+    }
+    if (lowered.empty() || lowered == "0" || lowered == "false" || lowered == "no" || lowered == "off") {
+        *value = false;
+        return true;
+    }
+    return false;
+}
+
+bool SetRuntimeControlRecordToggle(const std::string& text, TrainerRecordingOptions* recording) {
+    if (!recording) {
+        return false;
+    }
+    const std::string trimmed = TrimAscii(text);
+    const std::string lowered = ToLowerAscii(trimmed);
+    if (lowered.empty() || lowered == "off" || lowered == "none" || lowered == "immediate") {
+        recording->toggle_key_vk = 0;
+        recording->toggle_key_label.clear();
+        return true;
+    }
+    const int vk = ParseTriggerVirtualKeyName(trimmed);
+    if (vk <= 0) {
+        return false;
+    }
+    recording->toggle_key_vk = vk;
+    recording->toggle_key_label = trimmed;
+    return true;
+}
+
+bool LoadTrainerRuntimeControlFile(const std::string& path,
+                                   TrainerRuntimeControlSnapshot* snapshot,
+                                   std::string* error) {
+    if (!snapshot) {
+        if (error) *error = "runtime control output is null";
+        return false;
+    }
+    std::ifstream file(path);
+    if (!file) {
+        if (error) *error = "failed to open runtime control file";
+        return false;
+    }
+
+    TrainerRuntimeControlSnapshot parsed;
+    parsed.recording.start_immediately = true;
+    std::string line;
+    int line_number = 0;
+    while (std::getline(file, line)) {
+        ++line_number;
+        const std::string trimmed = TrimAscii(line);
+        if (trimmed.empty() || trimmed[0] == '#') {
+            continue;
+        }
+
+        std::vector<std::string> fields = SplitTabLine(line);
+        if (fields.empty()) {
+            continue;
+        }
+        const std::string key = ToLowerAscii(TrimAscii(fields[0]));
+        if (key == "recording_path") {
+            if (fields.size() < 2) {
+                if (error) *error = "line " + std::to_string(line_number) + " missing recording path";
+                return false;
+            }
+            parsed.recording.path = TrimAscii(fields[1]);
+            continue;
+        }
+        if (key == "record_duration") {
+            if (fields.size() < 2) {
+                if (error) *error = "line " + std::to_string(line_number) + " missing record duration";
+                return false;
+            }
+            const std::string value = TrimAscii(fields[1]);
+            char* end = nullptr;
+            const long seconds = std::strtol(value.c_str(), &end, 10);
+            if (value.empty() || !end || *end != '\0' || seconds < 0 || seconds > kTrainerProfileMaxSeconds) {
+                if (error) *error = "line " + std::to_string(line_number) + " has invalid record duration";
+                return false;
+            }
+            parsed.recording.max_seconds = static_cast<int>(seconds);
+            continue;
+        }
+        if (key == "record_toggle") {
+            if (fields.size() < 2 || !SetRuntimeControlRecordToggle(fields[1], &parsed.recording)) {
+                if (error) *error = "line " + std::to_string(line_number) + " has invalid record toggle";
+                return false;
+            }
+            continue;
+        }
+        if (key == "record_overwrite") {
+            if (fields.size() < 2 ||
+                !ParseRuntimeControlBool(fields[1], &parsed.recording.overwrite_existing)) {
+                if (error) *error = "line " + std::to_string(line_number) + " has invalid overwrite value";
+                return false;
+            }
+            continue;
+        }
+        if (key == "playback_loop") {
+            if (fields.size() < 2 ||
+                !ParseRuntimeControlBool(fields[1], &parsed.playback_bank.loop)) {
+                if (error) *error = "line " + std::to_string(line_number) + " has invalid playback loop value";
+                return false;
+            }
+            continue;
+        }
+        if (key == "bind" || key == "bind_block" || key == "bind-block" ||
+            key == "bind_block_live" || key == "bind-block-live") {
+            if (fields.size() < 4) {
+                if (error) *error = "line " + std::to_string(line_number) + " bind needs trigger, channels, and recording";
+                return false;
+            }
+            if (parsed.playback_bank.specs.size() >= kMaxPlaybackBankSlots) {
+                if (error) *error = "too many playback binds in runtime control file";
+                return false;
+            }
+            PlaybackBankSlotSpec spec;
+            spec.block_live_input = key != "bind";
+            if (!ParsePlaybackTrigger(fields[1], &spec.trigger) || spec.trigger.Immediate()) {
+                if (error) *error = "line " + std::to_string(line_number) + " has invalid bind trigger";
+                return false;
+            }
+            if (!ParsePlaybackChannelMask(fields[2], &spec.mask) || !spec.mask.Any()) {
+                if (error) *error = "line " + std::to_string(line_number) + " has invalid bind channels";
+                return false;
+            }
+            spec.recording_path = TrimAscii(fields[3]);
+            if (spec.recording_path.empty()) {
+                if (error) *error = "line " + std::to_string(line_number) + " bind recording path is empty";
+                return false;
+            }
+            if (fields.size() >= 5 &&
+                !ParseRuntimeControlBool(fields[4], &spec.block_live_input)) {
+                if (error) *error = "line " + std::to_string(line_number) + " has invalid bind live-input block value";
+                return false;
+            }
+            parsed.playback_bank.specs.push_back(std::move(spec));
+            continue;
+        }
+
+        if (error) *error = "line " + std::to_string(line_number) + " has unknown key '" + key + "'";
+        return false;
+    }
+
+    parsed.recording.start_immediately = !parsed.recording.ToggleMode();
+    *snapshot = std::move(parsed);
+    return true;
+}
+
+std::string FormatClipIndex(int clip_index) {
+    std::ostringstream stream;
+    stream << std::setw(3) << std::setfill('0') << clip_index;
+    return stream.str();
+}
+
+std::string MakeRecordingClipPath(const std::string& base_path, int clip_index) {
+    if (clip_index <= 1 && !std::filesystem::exists(base_path)) {
+        return base_path;
+    }
+
+    const std::filesystem::path path(base_path);
+    const std::filesystem::path parent = path.parent_path();
+    const std::string filename = path.filename().string();
+    const std::string lowered = ToLowerAscii(filename);
+    const std::string double_extension = ".gx12rec.csv";
+    const bool has_recording_extension =
+        lowered.size() >= double_extension.size() &&
+        lowered.compare(lowered.size() - double_extension.size(),
+                        double_extension.size(),
+                        double_extension) == 0;
+    const std::string stem = has_recording_extension
+        ? filename.substr(0, filename.size() - double_extension.size())
+        : path.stem().string();
+    const std::string extension = has_recording_extension
+        ? double_extension
+        : path.extension().string();
+
+    for (int candidate_index = std::max(1, clip_index); candidate_index < 10000; ++candidate_index) {
+        std::filesystem::path candidate = parent / (stem + "-" + FormatClipIndex(candidate_index) + extension);
+        if (!std::filesystem::exists(candidate)) {
+            return candidate.string();
+        }
+    }
+    return (parent / (stem + "-" + std::to_string(clip_index) + extension)).string();
+}
+
+int RunTrainerProfile(const TrainerProfile& initial_profile,
+                      bool guided,
+                      bool live_reload,
+                      const TrainerRecordingOptions& recording_options = TrainerRecordingOptions{},
+                      const TrainerPlaybackBankOptions& playback_bank_options = TrainerPlaybackBankOptions{},
+                      const TrainerRuntimeControlOptions& runtime_control_options = TrainerRuntimeControlOptions{}) {
     TrainerProfile active_profile = initial_profile;
+    TrainerRecordingOptions active_recording_options = recording_options;
+    TrainerPlaybackBankOptions active_playback_bank_options = playback_bank_options;
     g_stop_virtual_key.store(active_profile.stop_key_vk, std::memory_order_release);
     g_freeze_virtual_key.store(active_profile.freeze_key_vk, std::memory_order_release);
     const std::string profile_path = initial_profile.source_file;
@@ -6366,8 +8580,199 @@ int RunTrainerProfile(const TrainerProfile& initial_profile, bool guided, bool l
     timeouts.WriteTotalTimeoutMultiplier = 1;
     SetCommTimeouts(serial, &timeouts);
 
-    std::ofstream csv;
-    const bool csv_open = OpenCsvLog(active_profile, &csv);
+    TrainerCsvLogWriter csv_log;
+    const bool csv_open = csv_log.Open(active_profile);
+    const bool recording_hid_enabled = active_recording_options.Enabled();
+    Gx12RecordingHidCapture recording_hid;
+    RecordingCsvWriter recording_writer;
+    RecordingCommitQueue recording_commits;
+    bool recording_writer_open = false;
+    uint64_t recording_total_clips = 0;
+    uint64_t recording_failed_clips = 0;
+    uint64_t recording_total_sample_rows = 0;
+    uint64_t recording_total_hid_rows = 0;
+    std::string last_recording_path;
+    if (recording_hid_enabled) {
+        recording_commits.Start();
+        if (!recording_hid.Start()) {
+            std::fprintf(stderr,
+                         "warning: GX12 HID recording track unavailable: %s. Recording will continue without HID channels.\n",
+                         recording_hid.last_error.empty() ? "unknown error" : recording_hid.last_error.c_str());
+        }
+        if (active_recording_options.ToggleMode()) {
+            std::printf("recording_armed=%s key=%s max_seconds=%d multi_clip=true overwrite=%s buffer=memory commit=background tracks=trainer,mouse,keyboard%s\n",
+                        active_recording_options.path.c_str(),
+                        active_recording_options.toggle_key_label.c_str(),
+                        active_recording_options.max_seconds,
+                        active_recording_options.overwrite_existing ? "true" : "false",
+                        recording_hid.available ? ",gx12_hid" : "");
+        } else {
+            const int initial_mapper_rate_hz =
+                std::min(active_profile.frame_rate_hz, kTrainerMapperReferenceHz);
+            if (!recording_writer.Open(active_profile,
+                                       active_recording_options.path.c_str(),
+                                       initial_mapper_rate_hz,
+                                       recording_hid)) {
+                recording_hid.Stop();
+                CloseHandle(serial);
+                if (launcher_stop_event) CloseHandle(launcher_stop_event);
+                return 1;
+            }
+            recording_writer_open = true;
+            last_recording_path = recording_writer.path;
+            std::printf("recording=%s buffer=memory commit=background tracks=trainer,mouse,keyboard%s\n",
+                        active_recording_options.path.c_str(),
+                        recording_hid.available ? ",gx12_hid" : "");
+        }
+    }
+    if (runtime_control_options.Enabled()) {
+        std::printf("runtime_control=%s reload=250ms\n", runtime_control_options.path.c_str());
+    }
+
+    std::vector<PlaybackBankSlot> playback_slots;
+    std::vector<bool> playback_previous_down;
+    struct PendingRecordingCommitPath {
+        std::string finished_path_lower;
+        std::string selected_path_lower;
+    };
+    std::vector<PendingRecordingCommitPath> pending_recording_commit_paths;
+    auto recording_commit_pending_for_path = [&](const std::string& path_to_check) {
+        const std::string lowered = ToLowerAscii(path_to_check);
+        return std::find_if(pending_recording_commit_paths.begin(),
+                            pending_recording_commit_paths.end(),
+                            [&](const PendingRecordingCommitPath& pending) {
+                                return lowered == pending.finished_path_lower ||
+                                       lowered == pending.selected_path_lower;
+                            }) != pending_recording_commit_paths.end();
+    };
+    auto remove_pending_recording_commit_path = [&](const std::string& finished_path) {
+        const std::string lowered = ToLowerAscii(finished_path);
+        auto it = std::find_if(pending_recording_commit_paths.begin(),
+                               pending_recording_commit_paths.end(),
+                               [&](const PendingRecordingCommitPath& pending) {
+                                   return lowered == pending.finished_path_lower;
+                               });
+        if (it != pending_recording_commit_paths.end()) {
+            pending_recording_commit_paths.erase(it);
+        }
+    };
+    auto load_playback_slot_recording = [&](PlaybackBankSlot* slot, bool print_error) -> bool {
+        if (!slot) {
+            return false;
+        }
+        if (recording_commit_pending_for_path(slot->spec.recording_path)) {
+            if (print_error) {
+                std::fprintf(stderr,
+                             "trainer profile playback bind not ready for %s: recording save still in progress\n",
+                             slot->spec.recording_path.c_str());
+            }
+            return false;
+        }
+        if (slot->loaded) {
+            return true;
+        }
+
+        std::string error;
+        LoadedRecording loaded;
+        if (!LoadRecordingFile(slot->spec.recording_path.c_str(), &loaded, &error)) {
+            if (print_error) {
+                std::fprintf(stderr,
+                             "trainer profile playback bind not ready for %s: %s\n",
+                             slot->spec.recording_path.c_str(),
+                             error.c_str());
+            }
+            return false;
+        }
+        if (!ValidatePlaybackRecordingForCurrentBuild(loaded, slot->spec.recording_path.c_str())) {
+            return false;
+        }
+        if (loaded.metadata.resolution_mode != active_profile.resolution_mode) {
+            std::fprintf(stderr,
+                         "trainer profile playback bind resolution mismatch for %s: recording=%s profile=%s\n",
+                         slot->spec.recording_path.c_str(),
+                         TrainerResolutionModeName(loaded.metadata.resolution_mode),
+                         TrainerResolutionModeName(active_profile.resolution_mode));
+            return false;
+        }
+        slot->recording = std::move(loaded);
+        slot->mapper_tick_sample_indices =
+            BuildPlaybackMapperTickSampleIndices(slot->recording);
+        slot->loaded = true;
+        return true;
+    };
+
+    auto rebuild_playback_slots = [&](const TrainerPlaybackBankOptions& options,
+                                      const char* source_label) -> bool {
+        if (!options.Enabled()) {
+            playback_slots.clear();
+            playback_previous_down.clear();
+            return true;
+        }
+        if (options.specs.size() > kMaxPlaybackBankSlots) {
+            std::fprintf(stderr,
+                         "trainer profile playback bank supports at most %zu binding slots.\n",
+                         kMaxPlaybackBankSlots);
+            return false;
+        }
+        std::vector<PlaybackBankSlot> rebuilt;
+        rebuilt.reserve(options.specs.size());
+        for (const PlaybackBankSlotSpec& spec : options.specs) {
+            if (spec.trigger.Immediate()) {
+                std::fprintf(stderr,
+                             "trainer profile playback bind for %s needs a hotkey trigger.\n",
+                             spec.recording_path.c_str());
+                return false;
+            }
+            if (!spec.mask.Any()) {
+                std::fprintf(stderr,
+                             "trainer profile playback bind for %s needs at least one channel.\n",
+                             spec.recording_path.c_str());
+                return false;
+            }
+
+            PlaybackBankSlot slot;
+            slot.spec = spec;
+            if (std::filesystem::exists(slot.spec.recording_path)) {
+                (void)load_playback_slot_recording(&slot, true);
+            }
+            rebuilt.push_back(std::move(slot));
+        }
+
+        playback_slots = std::move(rebuilt);
+        playback_previous_down.assign(playback_slots.size(), false);
+        std::printf("playback_bank_integrated=true source=%s slots=%zu mode=%s\n",
+                    source_label ? source_label : "command",
+                    playback_slots.size(),
+                    options.loop ? "loop" : "once");
+        for (size_t index = 0; index < playback_slots.size(); ++index) {
+            const PlaybackBankSlot& slot = playback_slots[index];
+            const std::string sample_count = slot.loaded
+                ? std::to_string(slot.recording.samples.size())
+                : "pending";
+            std::printf("  [%zu] key=%s channels=%s live_input=%s samples=%s recording=%s\n",
+                        index + 1,
+                        slot.spec.trigger.label.c_str(),
+                        DescribePlaybackChannelMask(slot.spec.mask).c_str(),
+                        slot.spec.block_live_input ? "blocked" : "pass",
+                        sample_count.c_str(),
+                        slot.spec.recording_path.c_str());
+            if (slot.spec.mask.UsesThrottleOrYaw()) {
+                std::printf("      WARNING: bind includes recorded throttle/yaw; keep this sim/bench-only.\n");
+            }
+            if (slot.loaded && slot.spec.mask.UsesHidRightStick() && !slot.recording.has_hid_samples) {
+                std::printf("      WARNING: radio right-gimbal playback requested, but recording has no HID samples; ch1/ch2 will fall back to final trainer rows.\n");
+            }
+        }
+        return true;
+    };
+
+    if (!rebuild_playback_slots(active_playback_bank_options, "command")) {
+        recording_writer.Close();
+        recording_hid.Stop();
+        CloseHandle(serial);
+        if (launcher_stop_event) CloseHandle(launcher_stop_event);
+        return 2;
+    }
 
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 
@@ -6380,6 +8785,7 @@ int RunTrainerProfile(const TrainerProfile& initial_profile, bool guided, bool l
                                     live_reload || active_profile.keyboard_left.enabled,
                                     active_profile.mouse_right_device_token,
                                     active_profile.mouse_left.enabled ? active_profile.mouse_left_device_token : "")) {
+        recording_hid.Stop();
         CloseHandle(serial);
         if (launcher_stop_event) CloseHandle(launcher_stop_event);
         return 1;
@@ -6389,6 +8795,7 @@ int RunTrainerProfile(const TrainerProfile& initial_profile, bool guided, bool l
                                   &wooting_active,
                                   true)) {
         StopGameInputMouseCapture(&gameinput_capture);
+        recording_hid.Stop();
         CloseHandle(serial);
         if (launcher_stop_event) CloseHandle(launcher_stop_event);
         return 1;
@@ -6427,6 +8834,7 @@ int RunTrainerProfile(const TrainerProfile& initial_profile, bool guided, bool l
     if (active_profile.keyboard_left.enabled || active_profile.right_mouse_left.enabled) {
         std::fprintf(stderr,
                      "keyboard/right-mouse left-stick sources require a Microsoft.GameInput build; this binary only has foreground Raw Input.\n");
+        recording_hid.Stop();
         CloseHandle(serial);
         if (launcher_stop_event) CloseHandle(launcher_stop_event);
         return 2;
@@ -6438,6 +8846,7 @@ int RunTrainerProfile(const TrainerProfile& initial_profile, bool guided, bool l
     HWND hwnd = CreateMouseRateWindow(instance, MouseRateMode::Foreground);
     if (!hwnd) {
         std::fprintf(stderr, "No HWND available for trainer profile mode.\n");
+        recording_hid.Stop();
         CloseHandle(serial);
         if (launcher_stop_event) CloseHandle(launcher_stop_event);
         return 1;
@@ -6445,6 +8854,7 @@ int RunTrainerProfile(const TrainerProfile& initial_profile, bool guided, bool l
 
     if (!RegisterMouseRawInput(hwnd, MouseRateMode::Foreground)) {
         DestroyWindow(hwnd);
+        recording_hid.Stop();
         CloseHandle(serial);
         if (launcher_stop_event) CloseHandle(launcher_stop_event);
         return 1;
@@ -6489,6 +8899,8 @@ int RunTrainerProfile(const TrainerProfile& initial_profile, bool guided, bool l
     double return_step = active_profile.return_rate / static_cast<double>(mapper_rate_hz);
     auto next_print = start + std::chrono::milliseconds(250);
     auto next_profile_reload_check = start + std::chrono::milliseconds(250);
+    auto next_recording_hid_poll = start;
+    const auto recording_hid_poll_period = std::chrono::milliseconds(1);
     std::filesystem::file_time_type last_profile_write{};
     if (live_reload && !profile_path.empty()) {
         std::error_code ec;
@@ -6497,6 +8909,18 @@ int RunTrainerProfile(const TrainerProfile& initial_profile, bool guided, bool l
             std::fprintf(stderr,
                          "warning: profile live reload cannot stat '%s': %s\n",
                          profile_path.c_str(),
+                         ec.message().c_str());
+        }
+    }
+    auto next_runtime_control_check = start + std::chrono::milliseconds(250);
+    std::filesystem::file_time_type last_runtime_control_write{};
+    if (runtime_control_options.Enabled()) {
+        std::error_code ec;
+        last_runtime_control_write = std::filesystem::last_write_time(runtime_control_options.path, ec);
+        if (ec) {
+            std::fprintf(stderr,
+                         "warning: runtime control cannot stat '%s': %s\n",
+                         runtime_control_options.path.c_str(),
                          ec.message().c_str());
         }
     }
@@ -6525,9 +8949,14 @@ int RunTrainerProfile(const TrainerProfile& initial_profile, bool guided, bool l
     int last_yaw = 0;
     int64_t last_mapper_dx = 0;
     int64_t last_mapper_dy = 0;
+    int64_t last_right_mapper_wheel_x = 0;
     int64_t last_right_mapper_wheel_y = 0;
     int64_t last_left_mapper_dx = 0;
     int64_t last_left_mapper_dy = 0;
+    int64_t last_left_mapper_wheel_x = 0;
+    int64_t last_left_mapper_wheel_y = 0;
+    uint32_t last_right_mapper_buttons = 0;
+    uint32_t last_left_mapper_buttons = 0;
     double filtered_roll = 0.0;
     double filtered_pitch = 0.0;
     double filtered_left_yaw = 0.0;
@@ -6546,6 +8975,406 @@ int RunTrainerProfile(const TrainerProfile& initial_profile, bool guided, bool l
     double right_mouse_left_yaw_output = 0.0;
     AnalogKeyDepths last_analog_depths;
     bool last_freeze_down = false;
+    bool last_record_toggle_down = false;
+    bool recording_active = recording_writer_open && active_recording_options.start_immediately;
+    bool recording_finished = false;
+    int recording_clip_index = recording_writer_open ? 1 : 0;
+    std::string recording_clip_base_path = recording_writer_open ? active_recording_options.path : "";
+    bool recording_start_state_written = false;
+    auto recording_started_at = start;
+    auto recording_deadline = clock::time_point::max();
+    bool playback_active = false;
+    size_t playback_slot_index = 0;
+    auto normalize_runtime_path_key = [](const std::string& raw_path) -> std::string {
+        std::error_code ec;
+        std::filesystem::path path(raw_path);
+        std::filesystem::path absolute_path = std::filesystem::absolute(path, ec);
+        if (ec) {
+            absolute_path = path;
+        }
+        return ToLowerAscii(absolute_path.lexically_normal().string());
+    };
+    auto playback_binds_include_path = [&](const std::string& raw_path) -> bool {
+        const std::string target = normalize_runtime_path_key(raw_path);
+        if (target.empty()) {
+            return false;
+        }
+        for (const PlaybackBankSlot& slot : playback_slots) {
+            if (normalize_runtime_path_key(slot.spec.recording_path) == target) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    auto capture_recording_start_state = [&]() -> RecordingStartState {
+        RecordingStartState state =
+            MakeRecordingStartStateFromRightStick(filtered_roll,
+                                                  filtered_pitch,
+                                                  roll_elastic_state,
+                                                  pitch_elastic_state,
+                                                  last_roll,
+                                                  last_pitch);
+        if (active_profile.mouse_left.enabled) {
+            state.mouse_left_available = true;
+            state.mouse_left_throttle_value = keyboard_throttle;
+            state.mouse_left_yaw_value = keyboard_yaw;
+            state.mouse_left_yaw_filtered = filtered_left_yaw;
+            state.mouse_left_yaw_position = left_yaw_position;
+            state.mouse_left_yaw_dummy_position = left_yaw_dummy_position;
+            state.mouse_left_yaw_velocity = left_yaw_elastic_state.velocity;
+            state.mouse_left_yaw_dummy_velocity = left_yaw_dummy_state.velocity;
+            state.mouse_left_throttle_pulse = last_throttle;
+            state.mouse_left_yaw_pulse = last_yaw;
+        } else if (active_profile.right_mouse_left.enabled) {
+            state.right_mouse_left_available = true;
+            state.right_mouse_left_throttle_value = keyboard_throttle;
+            state.right_mouse_left_yaw_target = right_mouse_left_yaw_target;
+            state.right_mouse_left_yaw_output = right_mouse_left_yaw_output;
+            state.right_mouse_left_throttle_pulse = last_throttle;
+            state.right_mouse_left_yaw_pulse = last_yaw;
+        }
+        return state;
+    };
+
+    auto open_next_recording_clip = [&](bool preopen) -> bool {
+        if (!active_recording_options.Enabled() || recording_writer_open) {
+            return true;
+        }
+        if (recording_clip_base_path != active_recording_options.path) {
+            recording_clip_base_path = active_recording_options.path;
+            recording_clip_index = 0;
+        }
+        ++recording_clip_index;
+        const std::string clip_path = active_recording_options.ToggleMode()
+            ? (active_recording_options.overwrite_existing
+                   ? active_recording_options.path
+                   : MakeRecordingClipPath(active_recording_options.path,
+                                           recording_clip_index))
+            : active_recording_options.path;
+        if (preopen &&
+            active_recording_options.ToggleMode() &&
+            active_recording_options.overwrite_existing &&
+            playback_binds_include_path(clip_path)) {
+            std::printf("recording_preopen_skipped=playback-conflict path=%s\n",
+                        clip_path.c_str());
+            return true;
+        }
+        if (!recording_writer.Open(active_profile,
+                                   clip_path.c_str(),
+                                   mapper_rate_hz,
+                                   recording_hid)) {
+            return false;
+        }
+        recording_writer_open = true;
+        recording_start_state_written = false;
+        last_recording_path = recording_writer.path;
+        return true;
+    };
+
+    if (recording_writer_open) {
+        recording_writer.WriteStartState(capture_recording_start_state());
+        recording_start_state_written = true;
+    } else if (active_recording_options.Enabled() &&
+               active_recording_options.ToggleMode()) {
+        if (!open_next_recording_clip(true)) {
+#if defined(GX12_HAS_GAMEINPUT)
+            key_blocker.Stop();
+            StopGameInputMouseCapture(&gameinput_capture);
+#else
+            if (IsWindow(hwnd)) {
+                DestroyWindow(hwnd);
+            }
+#endif
+            csv_log.Close();
+            recording_hid.Stop();
+            CloseHandle(serial);
+            if (launcher_stop_event) CloseHandle(launcher_stop_event);
+            return 1;
+        }
+        if (recording_writer_open) {
+            std::printf("recording_preopened=%s buffer=memory commit=background\n",
+                        recording_writer.path.c_str());
+        }
+    }
+
+    auto begin_recording_clip = [&](clock::time_point now) -> bool {
+        if (!active_recording_options.Enabled() || recording_active) {
+            return true;
+        }
+        if (!active_recording_options.ToggleMode() && recording_finished) {
+            return true;
+        }
+        if (!recording_writer_open) {
+            if (!open_next_recording_clip(false)) {
+                return false;
+            }
+        }
+        if (!recording_start_state_written) {
+            recording_writer.WriteStartState(capture_recording_start_state());
+            recording_start_state_written = true;
+        }
+        recording_active = true;
+        recording_started_at = now;
+        recording_deadline = active_recording_options.max_seconds > 0
+            ? now + std::chrono::seconds(active_recording_options.max_seconds)
+            : clock::time_point::max();
+        std::printf("\nrecording started: %s buffer=memory commit=background\n",
+                    recording_writer.path.c_str());
+        std::fflush(stdout);
+        return true;
+    };
+
+    auto finish_recording_clip = [&](clock::time_point now, const char* reason) {
+        if (!active_recording_options.Enabled() || !recording_active) {
+            return;
+        }
+        recording_active = false;
+        if (!active_recording_options.ToggleMode()) {
+            recording_finished = true;
+        }
+        const std::string finished_path = recording_writer.path;
+        const uint64_t clip_sample_rows = recording_writer.sample_rows;
+        const uint64_t clip_hid_rows = recording_writer.hid_rows;
+        RecordingCsvWriter::CommitSnapshot commit_snapshot =
+            recording_writer.CloseToSnapshot();
+        commit_snapshot.selected_path = active_recording_options.path;
+        recording_writer_open = false;
+        recording_start_state_written = false;
+        recording_total_sample_rows += clip_sample_rows;
+        recording_total_hid_rows += clip_hid_rows;
+        last_recording_path = finished_path;
+        const double clip_seconds =
+            std::chrono::duration<double>(now - recording_started_at).count();
+        std::printf("\nrecording stopped (%s): %s duration=%.3fs samples=%llu hid_rows=%llu\n",
+                    reason,
+                    finished_path.c_str(),
+                    clip_seconds,
+                    static_cast<unsigned long long>(clip_sample_rows),
+                    static_cast<unsigned long long>(clip_hid_rows));
+        const std::string finished_path_lower = ToLowerAscii(finished_path);
+        const std::string selected_path_lower = ToLowerAscii(active_recording_options.path);
+        for (size_t slot_index = 0; slot_index < playback_slots.size(); ++slot_index) {
+            if (playback_active && slot_index == playback_slot_index) {
+                continue;
+            }
+            PlaybackBankSlot& slot = playback_slots[slot_index];
+            const std::string slot_path_lower = ToLowerAscii(slot.spec.recording_path);
+            if (slot_path_lower == finished_path_lower || slot_path_lower == selected_path_lower) {
+                slot.loaded = false;
+                slot.recording = LoadedRecording{};
+                slot.mapper_tick_sample_indices.clear();
+            }
+        }
+        pending_recording_commit_paths.push_back(
+            PendingRecordingCommitPath{finished_path_lower, selected_path_lower});
+        recording_commits.Enqueue(std::move(commit_snapshot));
+        std::printf("recording save queued: %s buffer=memory commit=background samples=%llu hid_rows=%llu\n",
+                    finished_path.c_str(),
+                    static_cast<unsigned long long>(clip_sample_rows),
+                    static_cast<unsigned long long>(clip_hid_rows));
+        std::fflush(stdout);
+    };
+
+    auto handle_recording_commit_result =
+        [&](const RecordingCsvWriter::CommitResult& result) {
+            remove_pending_recording_commit_path(result.path);
+            const bool usable_clip = result.ok && result.attempted && result.sample_rows > 0;
+            if (usable_clip) {
+                ++recording_total_clips;
+            } else {
+                ++recording_failed_clips;
+            }
+            if (usable_clip) {
+                std::printf("recording committed: %s buffer=memory commit=background bytes=%llu\n",
+                            result.path.c_str(),
+                            static_cast<unsigned long long>(result.bytes));
+            } else if (!result.ok) {
+                std::fprintf(stderr,
+                             "recording commit failed: %s buffer=memory commit=background error=%s\n",
+                             result.path.c_str(),
+                             result.error.empty() ? "unknown" : result.error.c_str());
+            } else if (result.sample_rows == 0) {
+                std::fprintf(stderr,
+                             "recording discarded: %s buffer=memory commit=background samples=0\n",
+                             result.path.c_str());
+            }
+            std::fflush(stdout);
+            if (!usable_clip) {
+                return;
+            }
+
+            const std::string finished_path_lower = ToLowerAscii(result.path);
+            const std::string selected_path_lower = ToLowerAscii(result.selected_path);
+            for (size_t slot_index = 0; slot_index < playback_slots.size(); ++slot_index) {
+                if (playback_active && slot_index == playback_slot_index) {
+                    continue;
+                }
+                PlaybackBankSlot& slot = playback_slots[slot_index];
+                const std::string slot_path_lower = ToLowerAscii(slot.spec.recording_path);
+                if (slot_path_lower == finished_path_lower ||
+                    slot_path_lower == selected_path_lower) {
+                    slot.loaded = false;
+                    slot.recording = LoadedRecording{};
+                    slot.mapper_tick_sample_indices.clear();
+                    (void)load_playback_slot_recording(&slot, false);
+                }
+            }
+        };
+
+    auto drain_recording_commit_results = [&]() {
+        std::vector<RecordingCsvWriter::CommitResult> results =
+            recording_commits.DrainCompleted();
+        for (const RecordingCsvWriter::CommitResult& result : results) {
+            handle_recording_commit_result(result);
+        }
+    };
+
+    if (recording_active && active_recording_options.max_seconds > 0) {
+        recording_deadline = start + std::chrono::seconds(active_recording_options.max_seconds);
+    }
+
+    size_t playback_sample_index = 0;
+    size_t playback_input_sample_index = 0;
+    size_t playback_mapper_tick_index = 0;
+    int playback_mapper_tick_frame = 0;
+    bool playback_input_have_mapper_tick = false;
+    uint32_t playback_input_last_mapper_tick = 0;
+    auto playback_started_at = start;
+    int64_t playback_base_us = 0;
+    RightStickPlaybackState playback_right_state;
+    LeftStickPlaybackState playback_left_state;
+    uint64_t integrated_playback_frames = 0;
+    uint64_t integrated_playback_input_ticks = 0;
+    uint64_t integrated_playback_starts = 0;
+
+    auto playback_slot_uses_frame_clocked_input = [&](const PlaybackBankSlot& slot) {
+        const bool right =
+            PlaybackChannelUsesInputInjection(slot.spec.mask, active_profile, 0) ||
+            PlaybackChannelUsesInputInjection(slot.spec.mask, active_profile, 1);
+        const bool left =
+            PlaybackChannelUsesInputInjection(slot.spec.mask, active_profile, 2) ||
+            PlaybackChannelUsesInputInjection(slot.spec.mask, active_profile, 3);
+        return right || left;
+    };
+
+    auto playback_slot_uses_normalized_mapper_clock = [&](const PlaybackBankSlot& slot) {
+        return (PlaybackMaskUsesOnlyRecordedOverlay(slot.spec.mask) ||
+                playback_slot_uses_frame_clocked_input(slot)) &&
+               PlaybackFramesPerRecordedMapperTick(active_profile, slot.recording) > 0 &&
+               !slot.mapper_tick_sample_indices.empty();
+    };
+
+    auto playback_slot_covers_primary_controls = [&](const PlaybackBankSlot& slot) {
+        return slot.spec.mask.enabled[0] &&
+               slot.spec.mask.enabled[1] &&
+               slot.spec.mask.enabled[2] &&
+               slot.spec.mask.enabled[3];
+    };
+
+    auto timing_sensitive_playback_active = [&]() {
+        return playback_active &&
+               playback_slot_index < playback_slots.size() &&
+               playback_slot_uses_normalized_mapper_clock(
+                   playback_slots[playback_slot_index]);
+    };
+
+    auto playback_can_skip_live_mapper = [&]() {
+        return timing_sensitive_playback_active() &&
+               playback_slot_covers_primary_controls(playback_slots[playback_slot_index]);
+    };
+
+    auto reset_integrated_playback_progress = [&](const PlaybackBankSlot& slot) {
+        playback_sample_index = 0;
+        playback_input_sample_index = 0;
+        playback_mapper_tick_index = 0;
+        playback_mapper_tick_frame = 0;
+        playback_input_have_mapper_tick = false;
+        playback_input_last_mapper_tick = 0;
+        playback_base_us = slot.recording.samples.empty() ? 0 : slot.recording.samples.front().time_us;
+        playback_right_state =
+            MakeRightStickPlaybackStateFromRecording(slot.recording.metadata.start_state);
+        playback_left_state =
+            MakeLeftStickPlaybackStateFromRecording(active_profile,
+                                                    slot.recording.metadata.start_state);
+    };
+
+    auto finish_integrated_playback = [&](const char* reason) {
+        if (!playback_active || playback_slot_index >= playback_slots.size()) {
+            playback_active = false;
+            return;
+        }
+        const PlaybackBankSlot& slot = playback_slots[playback_slot_index];
+        std::printf("playback bind %zu end: frames=%llu input_ticks=%llu reason=%s\n",
+                    playback_slot_index + 1,
+                    static_cast<unsigned long long>(integrated_playback_frames),
+                    static_cast<unsigned long long>(integrated_playback_input_ticks),
+                    reason);
+        std::fflush(stdout);
+        playback_active = false;
+        playback_sample_index = 0;
+        playback_input_sample_index = 0;
+        playback_mapper_tick_index = 0;
+        playback_mapper_tick_frame = 0;
+        playback_input_have_mapper_tick = false;
+        playback_input_last_mapper_tick = 0;
+        playback_base_us = 0;
+        (void)slot;
+    };
+
+    auto start_integrated_playback = [&](size_t index, clock::time_point now) {
+        if (index >= playback_slots.size()) {
+            return;
+        }
+        PlaybackBankSlot& slot = playback_slots[index];
+        if (!load_playback_slot_recording(&slot, true)) {
+            return;
+        }
+        if (slot.recording.samples.empty()) {
+            std::fprintf(stderr,
+                         "trainer profile playback bind has no samples: %s\n",
+                         slot.spec.recording_path.c_str());
+            return;
+        }
+        if (slot.recording.metadata.resolution_mode != active_profile.resolution_mode) {
+            std::fprintf(stderr,
+                         "trainer profile playback bind resolution mismatch for %s: recording=%s profile=%s\n",
+                         slot.spec.recording_path.c_str(),
+                         TrainerResolutionModeName(slot.recording.metadata.resolution_mode),
+                         TrainerResolutionModeName(active_profile.resolution_mode));
+            return;
+        }
+        if (!ResolveIntegratedPlaybackMaskForProfile(&slot.spec.mask,
+                                                     active_profile,
+                                                     slot.recording,
+                                                     slot.spec.recording_path,
+                                                     true)) {
+            return;
+        }
+        playback_active = true;
+        playback_slot_index = index;
+        playback_started_at = now;
+        reset_integrated_playback_progress(slot);
+        integrated_playback_frames = 0;
+        integrated_playback_input_ticks = 0;
+        ++integrated_playback_starts;
+        const bool normalized_clock =
+            playback_slot_uses_normalized_mapper_clock(slot);
+        const int normalized_frames_per_tick = normalized_clock
+            ? PlaybackFramesPerRecordedMapperTick(active_profile, slot.recording)
+            : 0;
+        const std::string playback_clock_label = normalized_clock
+            ? ("mapper-normalized/" + std::to_string(normalized_frames_per_tick))
+            : "sample-rows";
+        std::printf("playback bind %zu start: key=%s recording=%s channels=%s live_input=%s clock=%s\n",
+                    index + 1,
+                    slot.spec.trigger.label.c_str(),
+                    slot.spec.recording_path.c_str(),
+                    DescribePlaybackChannelMask(slot.spec.mask).c_str(),
+                    slot.spec.block_live_input ? "blocked" : "pass",
+                    playback_clock_label.c_str());
+        std::fflush(stdout);
+    };
 
     bool stop_requested = false;
     while (!stop_requested && (indefinite || clock::now() < end)) {
@@ -6580,7 +9409,134 @@ int RunTrainerProfile(const TrainerProfile& initial_profile, bool guided, bool l
 #endif
 
         const auto now = clock::now();
-        if (live_reload && now >= next_profile_reload_check && !profile_path.empty()) {
+        if (!timing_sensitive_playback_active()) {
+            drain_recording_commit_results();
+        }
+        if (runtime_control_options.Enabled() &&
+            !timing_sensitive_playback_active() &&
+            now >= next_runtime_control_check) {
+            std::error_code ec;
+            const auto write_time = std::filesystem::last_write_time(runtime_control_options.path, ec);
+            if (!ec && write_time != last_runtime_control_write) {
+                TrainerRuntimeControlSnapshot snapshot;
+                std::string error;
+                if (LoadTrainerRuntimeControlFile(runtime_control_options.path, &snapshot, &error)) {
+                    if (recording_active && snapshot.recording.path.empty()) {
+                        finish_recording_clip(now, "settings");
+                    }
+                    if (playback_active) {
+                        finish_integrated_playback("settings");
+                    }
+                    if (rebuild_playback_slots(snapshot.playback_bank, "control")) {
+                        const bool record_path_changed = active_recording_options.path != snapshot.recording.path;
+                        const bool record_key_changed =
+                            active_recording_options.toggle_key_vk != snapshot.recording.toggle_key_vk;
+                        active_recording_options = snapshot.recording;
+                        active_playback_bank_options = snapshot.playback_bank;
+                        if (record_path_changed) {
+                            recording_finished = false;
+                            if (!recording_active && recording_writer_open) {
+                                recording_writer.Close();
+                                recording_writer_open = false;
+                                recording_start_state_written = false;
+                            }
+                        }
+                        if (record_key_changed) {
+                            last_record_toggle_down = false;
+                        }
+                        if (active_recording_options.Enabled() &&
+                            !active_recording_options.ToggleMode() &&
+                            !recording_active &&
+                            !recording_finished &&
+                            !begin_recording_clip(now)) {
+                            stop_requested = true;
+                            break;
+                        }
+                        std::printf("runtime_control_reload=ok recording=%s overwrite=%s binds=%zu loop=%s\n",
+                                    active_recording_options.path.empty() ? "(off)" : active_recording_options.path.c_str(),
+                                    active_recording_options.overwrite_existing ? "true" : "false",
+                                    active_playback_bank_options.specs.size(),
+                                    active_playback_bank_options.loop ? "true" : "false");
+                        std::fflush(stdout);
+                        last_runtime_control_write = write_time;
+                    } else {
+                        std::fprintf(stderr,
+                                     "runtime_control_reload=failed; keeping previous playback binds: %s\n",
+                                     runtime_control_options.path.c_str());
+                        last_runtime_control_write = write_time;
+                    }
+                } else {
+                    std::fprintf(stderr,
+                                 "runtime_control_reload=failed; keeping previous settings: %s\n",
+                                 error.c_str());
+                    last_runtime_control_write = write_time;
+                }
+            } else if (ec && last_runtime_control_write != std::filesystem::file_time_type{}) {
+                std::fprintf(stderr,
+                             "runtime_control_reload=missing; keeping previous settings: %s\n",
+                             ec.message().c_str());
+                last_runtime_control_write = std::filesystem::file_time_type{};
+            }
+            do {
+                next_runtime_control_check += std::chrono::milliseconds(250);
+            } while (next_runtime_control_check <= now);
+        }
+        if (active_recording_options.Enabled() && active_recording_options.ToggleMode()) {
+            const bool record_toggle_down = RecordingToggleKeyDown(active_recording_options);
+            if (record_toggle_down && !last_record_toggle_down) {
+                if (!recording_active) {
+                    if (!begin_recording_clip(now)) {
+                        stop_requested = true;
+                        break;
+                    }
+                } else if (recording_active) {
+                    finish_recording_clip(now, "key");
+                }
+            }
+            last_record_toggle_down = record_toggle_down;
+        }
+        if (active_recording_options.Enabled() &&
+            recording_active &&
+            !timing_sensitive_playback_active() &&
+            (!recording_finished || active_recording_options.ToggleMode()) &&
+            now >= next_recording_hid_poll) {
+            recording_hid.Poll(&recording_writer, start);
+            do {
+                next_recording_hid_poll += recording_hid_poll_period;
+            } while (next_recording_hid_poll <= now);
+        }
+        if (recording_active && now >= recording_deadline) {
+            finish_recording_clip(now, "duration");
+        }
+        if (!playback_slots.empty()) {
+            for (size_t index = 0; index < playback_slots.size(); ++index) {
+                const bool down = PlaybackTriggerPressed(playback_slots[index].spec.trigger);
+                if (!down) {
+                    playback_previous_down[index] = false;
+                    continue;
+                }
+                if (playback_previous_down[index]) {
+                    continue;
+                }
+
+                playback_previous_down[index] = true;
+                if (playback_active) {
+                    if (index == playback_slot_index) {
+                        finish_integrated_playback("bind");
+                    } else {
+                        finish_integrated_playback("switch");
+                        start_integrated_playback(index, now);
+                    }
+                } else {
+                    start_integrated_playback(index, now);
+                }
+                break;
+            }
+        }
+        if (live_reload &&
+            !timing_sensitive_playback_active() &&
+            now >= next_profile_reload_check &&
+            !profile_path.empty()) {
             std::error_code ec;
             const auto write_time = std::filesystem::last_write_time(profile_path, ec);
             if (!ec && write_time != last_profile_write) {
@@ -6603,7 +9559,9 @@ int RunTrainerProfile(const TrainerProfile& initial_profile, bool guided, bool l
                     const bool right_mapper_model_changed =
                         reloaded.position_model != active_profile.position_model ||
                         reloaded.input_gain_mode != active_profile.input_gain_mode ||
-                        reloaded.gate_shape != active_profile.gate_shape;
+                        reloaded.gate_shape != active_profile.gate_shape ||
+                        reloaded.elastic_return_metric != active_profile.elastic_return_metric ||
+                        reloaded.elastic_return_activation != active_profile.elastic_return_activation;
                     const bool left_yaw_mapper_model_changed =
                         reloaded.mouse_left.yaw_shaping_enabled != active_profile.mouse_left.yaw_shaping_enabled ||
                         reloaded.mouse_left.yaw_position_model != active_profile.mouse_left.yaw_position_model ||
@@ -6730,21 +9688,61 @@ int RunTrainerProfile(const TrainerProfile& initial_profile, bool guided, bool l
             const GameInputMouseRoleSnapshot current_left = SnapshotGameInputRole(gameinput_capture.stats.left_mouse);
             last_mapper_dx = current_right.dx_sum - last_right_mapper.dx_sum;
             last_mapper_dy = current_right.dy_sum - last_right_mapper.dy_sum;
+            last_right_mapper_wheel_x =
+                current_right.wheel_x_sum - last_right_mapper.wheel_x_sum;
             last_right_mapper_wheel_y =
                 current_right.wheel_y_sum - last_right_mapper.wheel_y_sum;
             last_left_mapper_dx = current_left.dx_sum - last_left_mapper.dx_sum;
             last_left_mapper_dy = current_left.dy_sum - last_left_mapper.dy_sum;
+            last_left_mapper_wheel_x =
+                current_left.wheel_x_sum - last_left_mapper.wheel_x_sum;
+            last_left_mapper_wheel_y =
+                current_left.wheel_y_sum - last_left_mapper.wheel_y_sum;
+            last_right_mapper_buttons = current_right.buttons;
+            last_left_mapper_buttons = current_left.buttons;
             last_right_mapper = current_right;
             last_left_mapper = current_left;
 #else
             const MouseRateStats current = g_mouse_stats;
             last_mapper_dx = current.dx_sum - last_mapper.dx_sum;
             last_mapper_dy = current.dy_sum - last_mapper.dy_sum;
+            last_right_mapper_wheel_x = 0;
             last_right_mapper_wheel_y = 0;
             last_left_mapper_dx = 0;
             last_left_mapper_dy = 0;
+            last_left_mapper_wheel_x = 0;
+            last_left_mapper_wheel_y = 0;
+            last_right_mapper_buttons = 0;
+            last_left_mapper_buttons = 0;
 #endif
             last_mapper = current;
+
+            if (playback_can_skip_live_mapper()) {
+                last_mapper_dx = 0;
+                last_mapper_dy = 0;
+                last_right_mapper_wheel_x = 0;
+                last_right_mapper_wheel_y = 0;
+                last_left_mapper_dx = 0;
+                last_left_mapper_dy = 0;
+                last_left_mapper_wheel_x = 0;
+                last_left_mapper_wheel_y = 0;
+                last_right_mapper_buttons = 0;
+                last_left_mapper_buttons = 0;
+                last_analog_depths = {};
+            } else {
+            if (playback_active && playback_slot_index < playback_slots.size()) {
+                const PlaybackBankSlot& slot = playback_slots[playback_slot_index];
+                if (slot.spec.block_live_input) {
+                    ClearPlaybackLiveInputForMask(slot.spec,
+                                                  active_profile,
+                                                  &last_mapper_dx,
+                                                  &last_mapper_dy,
+                                                  &last_right_mapper_wheel_y,
+                                                  &last_right_mapper_buttons,
+                                                  &last_left_mapper_dx,
+                                                  &last_left_mapper_dy);
+                }
+            }
 
             if (active_profile.mouse_right_stick_enabled) {
                 if (active_profile.control_mode == ControlMode::DroneMouseAim) {
@@ -6961,7 +9959,7 @@ int RunTrainerProfile(const TrainerProfile& initial_profile, bool guided, bool l
                 const double wheel_axis_raw =
                     NormalizeGameInputWheelDelta(last_right_mapper_wheel_y);
                 const double button_axis_raw =
-                    static_cast<double>(GameInputMouse4Mouse5Axis(current_right.buttons));
+                    static_cast<double>(GameInputMouse4Mouse5Axis(last_right_mapper_buttons));
 
                 if (source.swap_axes) {
                     double throttle_axis = button_axis_raw;
@@ -7110,6 +10108,7 @@ int RunTrainerProfile(const TrainerProfile& initial_profile, bool guided, bool l
                     last_yaw = 0;
                 }
             }
+            }
             ++mapper_updates;
             do {
                 next_mapper += mapper_period;
@@ -7141,8 +10140,239 @@ int RunTrainerProfile(const TrainerProfile& initial_profile, bool guided, bool l
             trainer_pulses[1] = last_pitch;
             trainer_pulses[2] = last_throttle;
             trainer_pulses[3] = last_yaw;
+            uint8_t trainer_flags = TrainerActiveFlags(active_profile);
+            bool finish_playback_after_frame = false;
+            if (playback_active && playback_slot_index < playback_slots.size()) {
+                PlaybackBankSlot& slot = playback_slots[playback_slot_index];
+                const std::vector<RecordingSample>& samples = slot.recording.samples;
+                const bool normalized_mapper_clock =
+                    playback_slot_uses_normalized_mapper_clock(slot);
+                if (normalized_mapper_clock) {
+                    const std::vector<size_t>& tick_indices =
+                        slot.mapper_tick_sample_indices;
+                    if (playback_mapper_tick_index >= tick_indices.size()) {
+                        if (active_playback_bank_options.loop) {
+                            playback_started_at = now;
+                            reset_integrated_playback_progress(slot);
+                        } else {
+                            finish_integrated_playback("end");
+                        }
+                    }
+                    if (playback_active &&
+                        playback_mapper_tick_index < tick_indices.size()) {
+                        const int frames_per_tick =
+                            PlaybackFramesPerRecordedMapperTick(active_profile,
+                                                                slot.recording);
+                        const size_t sample_index =
+                            tick_indices[playback_mapper_tick_index];
+                        const RecordingSample& playback_sample = samples[sample_index];
+                        if (playback_slot_uses_frame_clocked_input(slot) &&
+                            playback_mapper_tick_frame == 0) {
+                            const bool playback_uses_right_input =
+                                PlaybackChannelUsesInputInjection(slot.spec.mask, active_profile, 0) ||
+                                PlaybackChannelUsesInputInjection(slot.spec.mask, active_profile, 1);
+                            const bool playback_uses_left_input =
+                                PlaybackChannelUsesInputInjection(slot.spec.mask, active_profile, 2) ||
+                                PlaybackChannelUsesInputInjection(slot.spec.mask, active_profile, 3);
+                            while (playback_input_sample_index < samples.size() &&
+                                   (!playback_input_have_mapper_tick ||
+                                    playback_input_last_mapper_tick != playback_sample.mapper_tick)) {
+                                const size_t before_index = playback_input_sample_index;
+                                const PlaybackInputInjection injection =
+                                    ConsumePlaybackInputInjection(slot,
+                                                                  active_profile,
+                                                                  0,
+                                                                  playback_base_us,
+                                                                  &playback_input_sample_index,
+                                                                  &playback_input_have_mapper_tick,
+                                                                  &playback_input_last_mapper_tick);
+                                if (injection.mapper_ticks == 0 ||
+                                    playback_input_sample_index == before_index) {
+                                    break;
+                                }
+                                if (playback_uses_right_input) {
+                                    StepRightStickPlaybackState(active_profile,
+                                                                injection.right_dx,
+                                                                injection.right_dy,
+                                                                mapper_rate_hz,
+                                                                &playback_right_state);
+                                }
+                                if (playback_uses_left_input) {
+                                    StepLeftStickPlaybackState(active_profile,
+                                                               injection,
+                                                               mapper_rate_hz,
+                                                               &playback_left_state);
+                                }
+                                integrated_playback_input_ticks += injection.mapper_ticks;
+                                if (playback_input_last_mapper_tick == playback_sample.mapper_tick) {
+                                    break;
+                                }
+                            }
+                        }
+                        const std::array<int, kSbusChannels> playback_pulses =
+                            BuildPlaybackPulses(playback_sample,
+                                                slot.spec.mask,
+                                                active_profile.resolution_mode);
+                        for (int ch = 0; ch < kSbusChannels; ++ch) {
+                            if (!slot.spec.mask.enabled[static_cast<size_t>(ch)]) {
+                                continue;
+                            }
+                            if (PlaybackChannelUsesInputInjection(slot.spec.mask, active_profile, ch)) {
+                                if (ch == 0) {
+                                    trainer_pulses[0] = slot.spec.block_live_input
+                                        ? playback_right_state.roll_pulse
+                                        : ClampTrainerOutput(
+                                              static_cast<int64_t>(trainer_pulses[0]) +
+                                                  playback_right_state.roll_pulse,
+                                              active_profile.resolution_mode);
+                                } else if (ch == 1) {
+                                    trainer_pulses[1] = slot.spec.block_live_input
+                                        ? playback_right_state.pitch_pulse
+                                        : ClampTrainerOutput(
+                                              static_cast<int64_t>(trainer_pulses[1]) +
+                                                  playback_right_state.pitch_pulse,
+                                              active_profile.resolution_mode);
+                                } else if (ch == 2) {
+                                    trainer_pulses[2] = slot.spec.block_live_input
+                                        ? playback_left_state.throttle_pulse
+                                        : ClampTrainerOutput(
+                                              static_cast<int64_t>(trainer_pulses[2]) +
+                                                  playback_left_state.throttle_pulse -
+                                                  TrainerLowValue(active_profile.resolution_mode),
+                                              active_profile.resolution_mode);
+                                } else if (ch == 3) {
+                                    trainer_pulses[3] = slot.spec.block_live_input
+                                        ? playback_left_state.yaw_pulse
+                                        : ClampTrainerOutput(
+                                              static_cast<int64_t>(trainer_pulses[3]) +
+                                                  playback_left_state.yaw_pulse,
+                                              active_profile.resolution_mode);
+                                }
+                            } else {
+                                trainer_pulses[static_cast<size_t>(ch)] =
+                                    playback_pulses[static_cast<size_t>(ch)];
+                            }
+                        }
+                        trainer_flags |= PlaybackActiveFlags(slot.spec.mask, active_profile.resolution_mode);
+                        ++integrated_playback_frames;
+                        ++playback_mapper_tick_frame;
+                        if (playback_mapper_tick_frame >= frames_per_tick) {
+                            playback_mapper_tick_frame = 0;
+                            ++playback_mapper_tick_index;
+                        }
+                        if (playback_mapper_tick_index >= tick_indices.size()) {
+                            finish_playback_after_frame = true;
+                        }
+                    }
+                } else {
+                    if (playback_sample_index >= samples.size()) {
+                        if (active_playback_bank_options.loop) {
+                            playback_started_at = now;
+                            reset_integrated_playback_progress(slot);
+                        } else {
+                            finish_integrated_playback("end");
+                        }
+                    }
+                    if (playback_active && playback_sample_index < samples.size()) {
+                        const RecordingSample& playback_sample = samples[playback_sample_index];
+                        if (playback_slot_uses_frame_clocked_input(slot)) {
+                            const bool playback_uses_right_input =
+                                PlaybackChannelUsesInputInjection(slot.spec.mask, active_profile, 0) ||
+                                PlaybackChannelUsesInputInjection(slot.spec.mask, active_profile, 1);
+                            const bool playback_uses_left_input =
+                                PlaybackChannelUsesInputInjection(slot.spec.mask, active_profile, 2) ||
+                                PlaybackChannelUsesInputInjection(slot.spec.mask, active_profile, 3);
+                            while (playback_input_sample_index < samples.size() &&
+                                   (!playback_input_have_mapper_tick ||
+                                    playback_input_last_mapper_tick != playback_sample.mapper_tick)) {
+                                const size_t before_index = playback_input_sample_index;
+                                const PlaybackInputInjection injection =
+                                    ConsumePlaybackInputInjection(slot,
+                                                                  active_profile,
+                                                                  0,
+                                                                  playback_base_us,
+                                                                  &playback_input_sample_index,
+                                                                  &playback_input_have_mapper_tick,
+                                                                  &playback_input_last_mapper_tick);
+                                if (injection.mapper_ticks == 0 ||
+                                    playback_input_sample_index == before_index) {
+                                    break;
+                                }
+                                if (playback_uses_right_input) {
+                                    StepRightStickPlaybackState(active_profile,
+                                                                injection.right_dx,
+                                                                injection.right_dy,
+                                                                mapper_rate_hz,
+                                                                &playback_right_state);
+                                }
+                                if (playback_uses_left_input) {
+                                    StepLeftStickPlaybackState(active_profile,
+                                                               injection,
+                                                               mapper_rate_hz,
+                                                               &playback_left_state);
+                                }
+                                integrated_playback_input_ticks += injection.mapper_ticks;
+                                if (playback_input_last_mapper_tick == playback_sample.mapper_tick) {
+                                    break;
+                                }
+                            }
+                            if (PlaybackChannelUsesInputInjection(slot.spec.mask, active_profile, 0)) {
+                                trainer_pulses[0] = slot.spec.block_live_input
+                                    ? playback_right_state.roll_pulse
+                                    : ClampTrainerOutput(
+                                          static_cast<int64_t>(trainer_pulses[0]) +
+                                              playback_right_state.roll_pulse,
+                                          active_profile.resolution_mode);
+                            }
+                            if (PlaybackChannelUsesInputInjection(slot.spec.mask, active_profile, 1)) {
+                                trainer_pulses[1] = slot.spec.block_live_input
+                                    ? playback_right_state.pitch_pulse
+                                    : ClampTrainerOutput(
+                                          static_cast<int64_t>(trainer_pulses[1]) +
+                                              playback_right_state.pitch_pulse,
+                                          active_profile.resolution_mode);
+                            }
+                            if (PlaybackChannelUsesInputInjection(slot.spec.mask, active_profile, 2)) {
+                                trainer_pulses[2] = slot.spec.block_live_input
+                                    ? playback_left_state.throttle_pulse
+                                    : ClampTrainerOutput(
+                                          static_cast<int64_t>(trainer_pulses[2]) +
+                                              playback_left_state.throttle_pulse -
+                                              TrainerLowValue(active_profile.resolution_mode),
+                                          active_profile.resolution_mode);
+                            }
+                            if (PlaybackChannelUsesInputInjection(slot.spec.mask, active_profile, 3)) {
+                                trainer_pulses[3] = slot.spec.block_live_input
+                                    ? playback_left_state.yaw_pulse
+                                    : ClampTrainerOutput(
+                                          static_cast<int64_t>(trainer_pulses[3]) +
+                                              playback_left_state.yaw_pulse,
+                                          active_profile.resolution_mode);
+                            }
+                        }
+
+                        const std::array<int, kSbusChannels> playback_pulses =
+                            BuildPlaybackPulses(playback_sample,
+                                                slot.spec.mask,
+                                                active_profile.resolution_mode);
+                        for (int ch = 0; ch < kSbusChannels; ++ch) {
+                            if (slot.spec.mask.enabled[static_cast<size_t>(ch)] &&
+                                !PlaybackChannelUsesInputInjection(slot.spec.mask, active_profile, ch)) {
+                                trainer_pulses[static_cast<size_t>(ch)] =
+                                    playback_pulses[static_cast<size_t>(ch)];
+                            }
+                        }
+                        trainer_flags |= PlaybackActiveFlags(slot.spec.mask, active_profile.resolution_mode);
+                        ++integrated_playback_frames;
+                        ++playback_sample_index;
+                        if (playback_sample_index >= samples.size()) {
+                            finish_playback_after_frame = true;
+                        }
+                    }
+                }
+            }
             BuildSbusFrame(trainer_pulses,
-                           TrainerActiveFlags(active_profile),
+                           trainer_flags,
                            active_profile.resolution_mode,
                            frame);
 
@@ -7160,63 +10390,104 @@ int RunTrainerProfile(const TrainerProfile& initial_profile, bool guided, bool l
 #else
                 DestroyWindow(hwnd);
 #endif
+                recording_hid.Stop();
                 CloseHandle(serial);
                 if (launcher_stop_event) CloseHandle(launcher_stop_event);
                 return 1;
             }
 
             ++frames;
-            if (csv_open && (frames % static_cast<uint32_t>(active_profile.log_every_n_frames) == 0U)) {
-                csv << std::chrono::duration<double>(now - start).count() << ','
-                    << frames << ','
-                    << current_events_total << ','
-                    << current_aux_total << ','
-                    << current_keyboard_total << ','
-                    << last_mapper_dx << ','
-                    << last_mapper_dy << ','
-                    << right_stick_state.raw_roll_source << ','
-                    << right_stick_state.raw_pitch_source << ','
-                    << right_stick_state.filtered_roll_source << ','
-                    << right_stick_state.filtered_pitch_source << ','
-                    << right_stick_state.despike_recent_count << ','
-                    << right_stick_state.despike_total_count << ','
-                    << last_left_mapper_dx << ','
-                    << last_left_mapper_dy << ','
-                    << left_yaw_mapper_state.raw_pitch_source << ','
-                    << left_yaw_mapper_state.filtered_pitch_source << ','
-                    << left_yaw_mapper_state.despike_recent_count << ','
-                    << left_yaw_mapper_state.despike_total_count << ','
-                    << PositionModelName(active_profile.mouse_left.yaw_position_model) << ','
-                    << left_yaw_mapper_state.adaptive_gain << ','
-                    << left_yaw_mapper_state.gate_scale << ','
-                    << (left_yaw_mapper_state.gimbal_antiwindup_active ? 1 : 0) << ','
-                    << PositionModelName(active_profile.position_model) << ','
-                    << right_stick_state.adaptive_gain << ','
-                    << right_stick_state.gate_scale << ','
-                    << (right_stick_state.gimbal_antiwindup_active ? 1 : 0) << ','
-                    << filtered_roll << ','
-                    << filtered_pitch << ','
-                    << roll_elastic_state.velocity << ','
-                    << pitch_elastic_state.velocity << ','
-                    << last_roll << ','
-                    << last_pitch << ','
-                    << last_throttle << ','
-                    << last_yaw << ','
-                    << mouse_aim_state.reticle_x << ','
-                    << mouse_aim_state.reticle_y << ','
-                    << last_analog_depths.throttle_up << ','
-                    << last_analog_depths.throttle_down << ','
-                    << last_analog_depths.yaw_left << ','
-                    << last_analog_depths.yaw_right << ','
-                    << last_analog_depths.throttle_cut << ','
-                    << late_us << '\n';
+            if (recording_active && recording_writer.IsOpen()) {
+                const int64_t time_us =
+                    std::chrono::duration_cast<std::chrono::microseconds>(now - start).count();
+                recording_writer.WriteSample(time_us,
+                                             frames,
+                                             mapper_updates,
+                                             current_events_total,
+                                             current_aux_total,
+                                             current_keyboard_total,
+                                             last_mapper_dx,
+                                             last_mapper_dy,
+                                             last_right_mapper_wheel_x,
+                                             last_right_mapper_wheel_y,
+                                             last_right_mapper_buttons,
+                                             last_left_mapper_dx,
+                                             last_left_mapper_dy,
+                                             last_left_mapper_wheel_x,
+                                             last_left_mapper_wheel_y,
+                                             last_left_mapper_buttons,
+                                             trainer_pulses,
+                                             recording_hid,
+                                             trainer_flags,
+                                             late_us);
+            }
+            if (csv_open &&
+                !timing_sensitive_playback_active() &&
+                (frames % static_cast<uint32_t>(active_profile.log_every_n_frames) == 0U)) {
+                TrainerCsvLogWriter::Row log_row;
+                log_row.time_s = std::chrono::duration<double>(now - start).count();
+                log_row.frame = frames;
+                log_row.mouse_events = current_events_total;
+                log_row.input_aux = current_aux_total;
+                log_row.keyboard_events = current_keyboard_total;
+                log_row.dx = last_mapper_dx;
+                log_row.dy = last_mapper_dy;
+                log_row.mouse_raw_dx = right_stick_state.raw_roll_source;
+                log_row.mouse_raw_dy = right_stick_state.raw_pitch_source;
+                log_row.mouse_filtered_dx = right_stick_state.filtered_roll_source;
+                log_row.mouse_filtered_dy = right_stick_state.filtered_pitch_source;
+                log_row.despike_recent_count = right_stick_state.despike_recent_count;
+                log_row.despike_total_count = right_stick_state.despike_total_count;
+                log_row.left_dx = last_left_mapper_dx;
+                log_row.left_dy = last_left_mapper_dy;
+                log_row.left_yaw_raw = left_yaw_mapper_state.raw_pitch_source;
+                log_row.left_yaw_filtered = left_yaw_mapper_state.filtered_pitch_source;
+                log_row.left_despike_recent_count = left_yaw_mapper_state.despike_recent_count;
+                log_row.left_despike_total_count = left_yaw_mapper_state.despike_total_count;
+                log_row.left_yaw_position_model = active_profile.mouse_left.yaw_position_model;
+                log_row.left_yaw_adaptive_gain = left_yaw_mapper_state.adaptive_gain;
+                log_row.left_yaw_gate_scale = left_yaw_mapper_state.gate_scale;
+                log_row.left_yaw_gimbal_antiwindup_active =
+                    left_yaw_mapper_state.gimbal_antiwindup_active;
+                log_row.position_model = active_profile.position_model;
+                log_row.adaptive_gain = right_stick_state.adaptive_gain;
+                log_row.gate_scale = right_stick_state.gate_scale;
+                log_row.gimbal_antiwindup_active =
+                    right_stick_state.gimbal_antiwindup_active;
+                log_row.roll_position = filtered_roll;
+                log_row.pitch_position = filtered_pitch;
+                log_row.roll_velocity = roll_elastic_state.velocity;
+                log_row.pitch_velocity = pitch_elastic_state.velocity;
+                log_row.roll = last_roll;
+                log_row.pitch = last_pitch;
+                log_row.throttle = last_throttle;
+                log_row.yaw = last_yaw;
+                log_row.aim_x = mouse_aim_state.reticle_x;
+                log_row.aim_y = mouse_aim_state.reticle_y;
+                log_row.analog_throttle_up = last_analog_depths.throttle_up;
+                log_row.analog_throttle_down = last_analog_depths.throttle_down;
+                log_row.analog_yaw_left = last_analog_depths.yaw_left;
+                log_row.analog_yaw_right = last_analog_depths.yaw_right;
+                log_row.analog_cut = last_analog_depths.throttle_cut;
+                log_row.late_us = late_us;
+                csv_log.Enqueue(log_row);
             }
             do {
                 next_frame += frame_period;
             } while (next_frame <= now);
+            if (finish_playback_after_frame && playback_active &&
+                playback_slot_index < playback_slots.size()) {
+                PlaybackBankSlot& slot = playback_slots[playback_slot_index];
+                if (active_playback_bank_options.loop) {
+                    playback_started_at = now;
+                    reset_integrated_playback_progress(slot);
+                } else {
+                    finish_integrated_playback("end");
+                }
+            }
         }
 
-        if (now >= next_print) {
+        if (!timing_sensitive_playback_active() && now >= next_print) {
 #if defined(GX12_HAS_GAMEINPUT)
             const GameInputMouseRateSnapshot current = SnapshotGameInputStats(gameinput_capture.stats);
             const GameInputMouseRoleSnapshot current_right = SnapshotGameInputRole(gameinput_capture.stats.right_mouse);
@@ -7277,6 +10548,10 @@ int RunTrainerProfile(const TrainerProfile& initial_profile, bool guided, bool l
             last_left_print = current_left;
 #endif
             next_print += std::chrono::milliseconds(250);
+        } else if (timing_sensitive_playback_active() && now >= next_print) {
+            do {
+                next_print += std::chrono::milliseconds(250);
+            } while (next_print <= now);
         }
 
 #if defined(GX12_HAS_GAMEINPUT)
@@ -7288,6 +10563,10 @@ int RunTrainerProfile(const TrainerProfile& initial_profile, bool guided, bool l
                                     QS_ALLINPUT,
                                     MWMO_INPUTAVAILABLE);
 #endif
+    }
+
+    if (playback_active) {
+        finish_integrated_playback(stop_requested ? "stop" : "end");
     }
 
     uint8_t neutral[25];
@@ -7333,8 +10612,38 @@ int RunTrainerProfile(const TrainerProfile& initial_profile, bool guided, bool l
     }
 
     if (csv_open) {
-        csv.flush();
-        std::printf("csv log: %s\n", active_profile.log_path.c_str());
+        const uint64_t dropped_csv_rows = csv_log.DroppedRows();
+        csv_log.Close();
+        std::printf("csv log: %s dropped_rows=%llu\n",
+                    active_profile.log_path.c_str(),
+                    static_cast<unsigned long long>(dropped_csv_rows));
+    }
+    if (recording_active) {
+        finish_recording_clip(clock::now(), stop_requested ? "stop" : "end");
+    }
+    if (active_recording_options.Enabled()) {
+        recording_writer.Close();
+        recording_commits.Stop();
+        drain_recording_commit_results();
+        std::printf("recording: base=%s clips=%llu failed_clips=%llu samples=%llu hid_rows=%llu hid_reports=%llu hid_decode_errors=%llu hid_read_errors=%llu last=%s\n",
+                    active_recording_options.path.c_str(),
+                    static_cast<unsigned long long>(recording_total_clips),
+                    static_cast<unsigned long long>(recording_failed_clips),
+                    static_cast<unsigned long long>(recording_total_sample_rows),
+                    static_cast<unsigned long long>(recording_total_hid_rows),
+                    static_cast<unsigned long long>(recording_hid.reports),
+                    static_cast<unsigned long long>(recording_hid.decode_errors),
+                    static_cast<unsigned long long>(recording_hid.read_errors),
+                    last_recording_path.empty() ? "(none)" : last_recording_path.c_str());
+        if (!recording_hid.last_error.empty() && recording_hid.read_errors > 0) {
+            std::printf("recording_hid_last_error: %s\n", recording_hid.last_error.c_str());
+        }
+    }
+    if (!playback_slots.empty()) {
+        std::printf("playback_bank_integrated: starts=%llu frames=%llu slots=%zu\n",
+                    static_cast<unsigned long long>(integrated_playback_starts),
+                    static_cast<unsigned long long>(integrated_playback_frames),
+                    playback_slots.size());
     }
 
 #if defined(GX12_HAS_GAMEINPUT)
@@ -7346,8 +10655,3208 @@ int RunTrainerProfile(const TrainerProfile& initial_profile, bool guided, bool l
         DestroyWindow(hwnd);
     }
 #endif
+    recording_hid.Stop();
     CloseHandle(serial);
     if (launcher_stop_event) CloseHandle(launcher_stop_event);
+    return 0;
+}
+
+constexpr size_t kRecordingColRowType = 0;
+constexpr size_t kRecordingColTimeUs = 1;
+constexpr size_t kRecordingColFrame = 2;
+constexpr size_t kRecordingColMapperTick = 3;
+constexpr size_t kRecordingColInputEvents = 4;
+constexpr size_t kRecordingColInputAux = 5;
+constexpr size_t kRecordingColKeyboardEvents = 6;
+constexpr size_t kRecordingColRightDx = 7;
+constexpr size_t kRecordingColRightDy = 8;
+constexpr size_t kRecordingColRightWheelX = 9;
+constexpr size_t kRecordingColRightWheelY = 10;
+constexpr size_t kRecordingColRightButtons = 11;
+constexpr size_t kRecordingColLeftDx = 12;
+constexpr size_t kRecordingColLeftDy = 13;
+constexpr size_t kRecordingColLeftWheelX = 14;
+constexpr size_t kRecordingColLeftWheelY = 15;
+constexpr size_t kRecordingColLeftButtons = 16;
+constexpr size_t kRecordingColFinalFirst = 17;
+constexpr size_t kRecordingColHidReports = kRecordingColFinalFirst + kSbusChannels;
+constexpr size_t kRecordingColHidValid = kRecordingColHidReports + 1;
+constexpr size_t kRecordingColHidButtons = kRecordingColHidReports + 2;
+constexpr size_t kRecordingColHidFirst = kRecordingColHidReports + 3;
+constexpr size_t kRecordingColTrainerFlags = kRecordingColHidFirst + kGx12ChannelCount;
+constexpr size_t kRecordingColLateUs = kRecordingColTrainerFlags + 1;
+constexpr size_t kRecordingMinColumns = kRecordingColLateUs + 1;
+
+bool ParseInt64Strict(const std::string& text, int64_t* value) {
+    if (!value) {
+        return false;
+    }
+    const std::string trimmed = TrimAscii(text);
+    if (trimmed.empty()) {
+        return false;
+    }
+    char* end = nullptr;
+    const long long parsed = std::strtoll(trimmed.c_str(), &end, 10);
+    if (!end || *end != '\0') {
+        return false;
+    }
+    *value = static_cast<int64_t>(parsed);
+    return true;
+}
+
+bool ParseUInt64Strict(const std::string& text, uint64_t* value) {
+    if (!value) {
+        return false;
+    }
+    const std::string trimmed = TrimAscii(text);
+    if (trimmed.empty() || trimmed[0] == '-') {
+        return false;
+    }
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(trimmed.c_str(), &end, 10);
+    if (!end || *end != '\0') {
+        return false;
+    }
+    *value = static_cast<uint64_t>(parsed);
+    return true;
+}
+
+bool ParseDoubleStrict(const std::string& text, double* value) {
+    if (!value) {
+        return false;
+    }
+    const std::string trimmed = TrimAscii(text);
+    if (trimmed.empty()) {
+        return false;
+    }
+    char* end = nullptr;
+    const double parsed = std::strtod(trimmed.c_str(), &end);
+    if (!end || *end != '\0' || !std::isfinite(parsed)) {
+        return false;
+    }
+    *value = parsed;
+    return true;
+}
+
+int64_t FieldToInt64(const std::vector<std::string>& fields, size_t index, int64_t fallback = 0) {
+    if (index >= fields.size()) {
+        return fallback;
+    }
+    int64_t value = 0;
+    return ParseInt64Strict(fields[index], &value) ? value : fallback;
+}
+
+int FieldToInt(const std::vector<std::string>& fields, size_t index, int fallback = 0) {
+    const int64_t value = FieldToInt64(fields, index, fallback);
+    if (value < static_cast<int64_t>(std::numeric_limits<int>::min())) {
+        return std::numeric_limits<int>::min();
+    }
+    if (value > static_cast<int64_t>(std::numeric_limits<int>::max())) {
+        return std::numeric_limits<int>::max();
+    }
+    return static_cast<int>(value);
+}
+
+uint64_t FieldToUInt64(const std::vector<std::string>& fields, size_t index, uint64_t fallback = 0) {
+    if (index >= fields.size()) {
+        return fallback;
+    }
+    uint64_t value = 0;
+    return ParseUInt64Strict(fields[index], &value) ? value : fallback;
+}
+
+void ApplyRecordingMetadataLine(const std::string& line, RecordingMetadata* metadata) {
+    if (!metadata || line.empty() || line[0] != '#') {
+        return;
+    }
+    std::string body = TrimAscii(line.substr(1));
+    const size_t equals = body.find('=');
+    if (equals == std::string::npos) {
+        return;
+    }
+    const std::string key = TrimAscii(body.substr(0, equals));
+    const std::string value = TrimAscii(body.substr(equals + 1));
+    if (key == kRecordingMagic) {
+        int64_t schema = 0;
+        if (ParseInt64Strict(value, &schema)) {
+            metadata->schema = static_cast<int>(schema);
+        }
+    } else if (key == "app_version") {
+        metadata->app_version = value;
+    } else if (key == "profile_name") {
+        metadata->profile_name = value;
+    } else if (key == "profile_path") {
+        metadata->profile_path = value;
+    } else if (key == "profile_fnv1a64") {
+        metadata->profile_hash = value;
+    } else if (key == "recording_buffer") {
+        metadata->recording_buffer = value.empty() ? "unknown" : value;
+    } else if (key == "trainer_frame_rate_hz") {
+        int64_t parsed = 0;
+        if (ParseInt64Strict(value, &parsed)) {
+            metadata->trainer_frame_rate_hz = static_cast<int>(parsed);
+        }
+    } else if (key == "mapper_rate_hz") {
+        int64_t parsed = 0;
+        if (ParseInt64Strict(value, &parsed)) {
+            metadata->mapper_rate_hz = static_cast<int>(parsed);
+        }
+    } else if (key == "trainer_resolution_mode") {
+        TrainerResolutionMode mode = TrainerResolutionMode::Legacy;
+        if (ParseTrainerResolutionModeName(value, &mode)) {
+            metadata->resolution_mode = mode;
+        }
+    } else if (key == "hid_available") {
+        const std::string lowered = ToLowerAscii(value);
+        metadata->hid_available_header = lowered == "true" || lowered == "1" || lowered == "yes";
+    } else if (key == "playback_start_right_mapper_state") {
+        const std::string lowered = ToLowerAscii(value);
+        metadata->start_state.right_mapper_available =
+            lowered == "true" || lowered == "1" || lowered == "yes";
+    } else if (key == "playback_start_right_roll_value") {
+        (void)ParseDoubleStrict(value, &metadata->start_state.right_roll_value);
+    } else if (key == "playback_start_right_pitch_value") {
+        (void)ParseDoubleStrict(value, &metadata->start_state.right_pitch_value);
+    } else if (key == "playback_start_right_roll_velocity") {
+        (void)ParseDoubleStrict(value, &metadata->start_state.right_roll_velocity);
+    } else if (key == "playback_start_right_pitch_velocity") {
+        (void)ParseDoubleStrict(value, &metadata->start_state.right_pitch_velocity);
+    } else if (key == "playback_start_right_roll_pulse") {
+        int64_t parsed = 0;
+        if (ParseInt64Strict(value, &parsed)) {
+            metadata->start_state.right_roll_pulse = static_cast<int>(parsed);
+        }
+    } else if (key == "playback_start_right_pitch_pulse") {
+        int64_t parsed = 0;
+        if (ParseInt64Strict(value, &parsed)) {
+            metadata->start_state.right_pitch_pulse = static_cast<int>(parsed);
+        }
+    } else if (key == "playback_start_mouse_left_state") {
+        const std::string lowered = ToLowerAscii(value);
+        metadata->start_state.mouse_left_available =
+            lowered == "true" || lowered == "1" || lowered == "yes";
+    } else if (key == "playback_start_mouse_left_throttle_value") {
+        (void)ParseDoubleStrict(value, &metadata->start_state.mouse_left_throttle_value);
+    } else if (key == "playback_start_mouse_left_yaw_value") {
+        (void)ParseDoubleStrict(value, &metadata->start_state.mouse_left_yaw_value);
+    } else if (key == "playback_start_mouse_left_yaw_filtered") {
+        (void)ParseDoubleStrict(value, &metadata->start_state.mouse_left_yaw_filtered);
+    } else if (key == "playback_start_mouse_left_yaw_position") {
+        (void)ParseDoubleStrict(value, &metadata->start_state.mouse_left_yaw_position);
+    } else if (key == "playback_start_mouse_left_yaw_dummy_position") {
+        (void)ParseDoubleStrict(value, &metadata->start_state.mouse_left_yaw_dummy_position);
+    } else if (key == "playback_start_mouse_left_yaw_velocity") {
+        (void)ParseDoubleStrict(value, &metadata->start_state.mouse_left_yaw_velocity);
+    } else if (key == "playback_start_mouse_left_yaw_dummy_velocity") {
+        (void)ParseDoubleStrict(value, &metadata->start_state.mouse_left_yaw_dummy_velocity);
+    } else if (key == "playback_start_mouse_left_throttle_pulse") {
+        int64_t parsed = 0;
+        if (ParseInt64Strict(value, &parsed)) {
+            metadata->start_state.mouse_left_throttle_pulse = static_cast<int>(parsed);
+        }
+    } else if (key == "playback_start_mouse_left_yaw_pulse") {
+        int64_t parsed = 0;
+        if (ParseInt64Strict(value, &parsed)) {
+            metadata->start_state.mouse_left_yaw_pulse = static_cast<int>(parsed);
+        }
+    } else if (key == "playback_start_right_mouse_left_state") {
+        const std::string lowered = ToLowerAscii(value);
+        metadata->start_state.right_mouse_left_available =
+            lowered == "true" || lowered == "1" || lowered == "yes";
+    } else if (key == "playback_start_right_mouse_left_throttle_value") {
+        (void)ParseDoubleStrict(value, &metadata->start_state.right_mouse_left_throttle_value);
+    } else if (key == "playback_start_right_mouse_left_yaw_target") {
+        (void)ParseDoubleStrict(value, &metadata->start_state.right_mouse_left_yaw_target);
+    } else if (key == "playback_start_right_mouse_left_yaw_output") {
+        (void)ParseDoubleStrict(value, &metadata->start_state.right_mouse_left_yaw_output);
+    } else if (key == "playback_start_right_mouse_left_throttle_pulse") {
+        int64_t parsed = 0;
+        if (ParseInt64Strict(value, &parsed)) {
+            metadata->start_state.right_mouse_left_throttle_pulse = static_cast<int>(parsed);
+        }
+    } else if (key == "playback_start_right_mouse_left_yaw_pulse") {
+        int64_t parsed = 0;
+        if (ParseInt64Strict(value, &parsed)) {
+            metadata->start_state.right_mouse_left_yaw_pulse = static_cast<int>(parsed);
+        }
+    }
+}
+
+bool LoadRecordingFile(const char* path, LoadedRecording* recording, std::string* error) {
+    if (!path || path[0] == '\0') {
+        if (error) *error = "recording path is empty";
+        return false;
+    }
+    if (!recording) {
+        if (error) *error = "internal recording output is null";
+        return false;
+    }
+
+    std::ifstream file(path);
+    if (!file) {
+        if (error) *error = std::string("failed to open recording: ") + path;
+        return false;
+    }
+
+    LoadedRecording loaded;
+    std::string line;
+    uint64_t line_number = 0;
+    while (std::getline(file, line)) {
+        ++line_number;
+        if (line.empty()) {
+            continue;
+        }
+        if (line[0] == '#') {
+            ApplyRecordingMetadataLine(line, &loaded.metadata);
+            continue;
+        }
+
+        std::vector<std::string> fields = SplitSimpleCsvLine(line);
+        if (fields.empty() || fields[kRecordingColRowType] == "row_type") {
+            continue;
+        }
+        if (fields.size() < kRecordingMinColumns) {
+            if (error) {
+                *error = "recording row " + std::to_string(line_number) +
+                         " has too few columns";
+            }
+            return false;
+        }
+
+        const std::string row_type = fields[kRecordingColRowType];
+        if (row_type == "hid") {
+            ++loaded.hid_rows;
+            continue;
+        }
+        if (row_type != "sample") {
+            continue;
+        }
+
+        RecordingSample sample;
+        int64_t parsed = 0;
+        if (!ParseInt64Strict(fields[kRecordingColTimeUs], &sample.time_us)) {
+            if (error) {
+                *error = "recording row " + std::to_string(line_number) +
+                         " has invalid time_us";
+            }
+            return false;
+        }
+        if (ParseInt64Strict(fields[kRecordingColFrame], &parsed)) {
+            sample.frame = static_cast<uint32_t>(std::max<int64_t>(0, parsed));
+        }
+        if (ParseInt64Strict(fields[kRecordingColMapperTick], &parsed)) {
+            sample.mapper_tick = static_cast<uint32_t>(std::max<int64_t>(0, parsed));
+        }
+        sample.right_dx = FieldToInt64(fields, kRecordingColRightDx);
+        sample.right_dy = FieldToInt64(fields, kRecordingColRightDy);
+        sample.right_wheel_x = FieldToInt64(fields, kRecordingColRightWheelX);
+        sample.right_wheel_y = FieldToInt64(fields, kRecordingColRightWheelY);
+        sample.right_buttons =
+            static_cast<uint32_t>(FieldToUInt64(fields, kRecordingColRightButtons) & 0xFFFFFFFFULL);
+        sample.left_dx = FieldToInt64(fields, kRecordingColLeftDx);
+        sample.left_dy = FieldToInt64(fields, kRecordingColLeftDy);
+        sample.left_wheel_x = FieldToInt64(fields, kRecordingColLeftWheelX);
+        sample.left_wheel_y = FieldToInt64(fields, kRecordingColLeftWheelY);
+        sample.left_buttons =
+            static_cast<uint32_t>(FieldToUInt64(fields, kRecordingColLeftButtons) & 0xFFFFFFFFULL);
+        for (int ch = 0; ch < kSbusChannels; ++ch) {
+            sample.final_channels[static_cast<size_t>(ch)] =
+                FieldToInt(fields, kRecordingColFinalFirst + static_cast<size_t>(ch));
+        }
+        sample.hid_reports = FieldToUInt64(fields, kRecordingColHidReports);
+        sample.hid_valid = FieldToInt(fields, kRecordingColHidValid) != 0;
+        sample.hid_buttons = static_cast<uint32_t>(FieldToUInt64(fields, kRecordingColHidButtons));
+        for (int ch = 0; ch < kGx12ChannelCount; ++ch) {
+            sample.hid_channels[static_cast<size_t>(ch)] =
+                FieldToInt(fields, kRecordingColHidFirst + static_cast<size_t>(ch));
+        }
+        sample.trainer_flags = static_cast<uint8_t>(FieldToUInt64(fields, kRecordingColTrainerFlags) & 0xFFU);
+        sample.late_us = FieldToInt(fields, kRecordingColLateUs);
+        loaded.has_hid_samples = loaded.has_hid_samples || sample.hid_valid;
+        loaded.samples.push_back(sample);
+    }
+
+    if (loaded.metadata.schema != kRecordingSchemaVersion) {
+        if (error) {
+            *error = "unsupported or missing recording schema version";
+        }
+        return false;
+    }
+    if (loaded.samples.empty()) {
+        if (error) {
+            *error = "recording has no sample rows";
+        }
+        return false;
+    }
+
+    *recording = std::move(loaded);
+    return true;
+}
+
+std::vector<size_t> BuildPlaybackMapperTickSampleIndices(const LoadedRecording& recording) {
+    std::vector<size_t> indices;
+    indices.reserve(recording.samples.size());
+    bool have_tick = false;
+    uint32_t last_tick = 0;
+    for (size_t index = 0; index < recording.samples.size(); ++index) {
+        const uint32_t tick = recording.samples[index].mapper_tick;
+        if (!have_tick || tick != last_tick) {
+            indices.push_back(index);
+            have_tick = true;
+            last_tick = tick;
+        } else if (!indices.empty()) {
+            indices.back() = index;
+        }
+    }
+    return indices;
+}
+
+bool PlaybackMaskUsesOnlyRecordedOverlay(const PlaybackChannelMask& mask) {
+    bool any_enabled = false;
+    for (int ch = 0; ch < kSbusChannels; ++ch) {
+        const size_t index = static_cast<size_t>(ch);
+        if (!mask.enabled[index]) {
+            continue;
+        }
+        any_enabled = true;
+        if (mask.use_pc_input[index]) {
+            return false;
+        }
+    }
+    return any_enabled;
+}
+
+int PlaybackFramesPerRecordedMapperTick(const TrainerProfile& profile,
+                                        const LoadedRecording& recording) {
+    const int mapper_rate_hz = recording.metadata.mapper_rate_hz > 0
+        ? recording.metadata.mapper_rate_hz
+        : std::min(profile.frame_rate_hz, kTrainerMapperReferenceHz);
+    if (profile.frame_rate_hz <= 0 ||
+        mapper_rate_hz <= 0 ||
+        profile.frame_rate_hz % mapper_rate_hz != 0) {
+        return 0;
+    }
+    return std::max(1, profile.frame_rate_hz / mapper_rate_hz);
+}
+
+int HidCenteredToTrainerOutput(int centered, TrainerResolutionMode mode) {
+    if (mode == TrainerResolutionMode::Gx12_2x) {
+        return ClampTrainerResx(centered);
+    }
+    return ClampTrainerPulse(RoundScaleSigned(centered, 1, 2));
+}
+
+void ClearPlaybackChannelMask(PlaybackChannelMask* mask) {
+    if (!mask) {
+        return;
+    }
+    mask->enabled.fill(false);
+    mask->use_hid.fill(false);
+    mask->use_pc_input.fill(false);
+}
+
+void EnablePlaybackChannel(PlaybackChannelMask* mask, int channel_1_based) {
+    if (mask && channel_1_based >= 1 && channel_1_based <= kSbusChannels) {
+        const size_t index = static_cast<size_t>(channel_1_based - 1);
+        mask->enabled[index] = true;
+        mask->use_hid[index] = false;
+        mask->use_pc_input[index] = channel_1_based <= 4;
+    }
+}
+
+void EnablePlaybackPcInputChannel(PlaybackChannelMask* mask, int channel_1_based) {
+    if (mask && channel_1_based >= 1 && channel_1_based <= kSbusChannels) {
+        const size_t index = static_cast<size_t>(channel_1_based - 1);
+        mask->enabled[index] = true;
+        mask->use_hid[index] = false;
+        mask->use_pc_input[index] = true;
+    }
+}
+
+void EnablePlaybackFinalChannel(PlaybackChannelMask* mask, int channel_1_based) {
+    if (mask && channel_1_based >= 1 && channel_1_based <= kSbusChannels) {
+        const size_t index = static_cast<size_t>(channel_1_based - 1);
+        mask->enabled[index] = true;
+        mask->use_hid[index] = false;
+        mask->use_pc_input[index] = false;
+    }
+}
+
+void EnablePlaybackHidChannel(PlaybackChannelMask* mask, int channel_1_based) {
+    if (mask && channel_1_based >= 1 && channel_1_based <= kSbusChannels) {
+        const size_t index = static_cast<size_t>(channel_1_based - 1);
+        mask->enabled[index] = true;
+        mask->use_pc_input[index] = false;
+        mask->use_hid[index] = false;
+        if (channel_1_based <= kGx12ChannelCount) {
+            mask->use_hid[index] = true;
+        }
+    }
+}
+
+void EnablePlaybackHidRange(PlaybackChannelMask* mask, int first_channel, int last_channel) {
+    for (int ch = first_channel; ch <= last_channel; ++ch) {
+        EnablePlaybackHidChannel(mask, ch);
+    }
+}
+
+bool EnablePlaybackChannelToken(const std::string& raw_token, PlaybackChannelMask* mask) {
+    if (!mask) {
+        return false;
+    }
+    std::string token = ToLowerAscii(TrimAscii(raw_token));
+    if (token.empty()) {
+        return true;
+    }
+    if (token == "none" || token == "off") {
+        ClearPlaybackChannelMask(mask);
+        return true;
+    }
+    if (token == "right" || token == "right_stick" || token == "right-stick") {
+        EnablePlaybackChannel(mask, 1);
+        EnablePlaybackChannel(mask, 2);
+        return true;
+    }
+    if (token == "trainer_right" || token == "trainer-right" ||
+        token == "trainer_right_stick" || token == "trainer-right-stick" ||
+        token == "final_right" || token == "final-right" ||
+        token == "final_right_stick" || token == "final-right-stick" ||
+        token == "recorded_right" || token == "recorded-right" ||
+        token == "recorded_right_stick" || token == "recorded-right-stick" ||
+        token == "trainer_output_right" || token == "trainer-output-right") {
+        EnablePlaybackFinalChannel(mask, 1);
+        EnablePlaybackFinalChannel(mask, 2);
+        return true;
+    }
+    if (token == "radio_right" || token == "radio-right" ||
+        token == "radio_right_stick" || token == "radio-right-stick" ||
+        token == "hid_right" || token == "hid-right" ||
+        token == "hid_right_stick" || token == "hid-right-stick" ||
+        token == "right_gimbal" || token == "right-gimbal" ||
+        token == "right_gimbals" || token == "right-gimbals" ||
+        token == "gimbal_right" || token == "gimbal-right") {
+        EnablePlaybackHidRange(mask, 1, 2);
+        return true;
+    }
+    if (token == "left" || token == "left_stick" || token == "left-stick") {
+        EnablePlaybackChannel(mask, 3);
+        EnablePlaybackChannel(mask, 4);
+        return true;
+    }
+    if (token == "mouse_left" || token == "mouse-left" ||
+        token == "pc_left" || token == "pc-left" ||
+        token == "input_left" || token == "input-left" ||
+        token == "mouse_left_stick" || token == "mouse-left-stick" ||
+        token == "pc_left_stick" || token == "pc-left-stick" ||
+        token == "left_input" || token == "left-input") {
+        EnablePlaybackPcInputChannel(mask, 3);
+        EnablePlaybackPcInputChannel(mask, 4);
+        return true;
+    }
+    if (token == "radio_left" || token == "radio-left" ||
+        token == "radio_left_stick" || token == "radio-left-stick" ||
+        token == "hid_left" || token == "hid-left" ||
+        token == "hid_left_stick" || token == "hid-left-stick" ||
+        token == "left_gimbal" || token == "left-gimbal" ||
+        token == "left_gimbals" || token == "left-gimbals" ||
+        token == "gimbal_left" || token == "gimbal-left") {
+        EnablePlaybackHidRange(mask, 3, 4);
+        return true;
+    }
+    if (token == "gimbals" || token == "sticks_hid" || token == "sticks-hid" ||
+        token == "radio" || token == "radio_sticks" || token == "radio-sticks" ||
+        token == "radio_gimbals" || token == "radio-gimbals" ||
+        token == "hid" || token == "hid_sticks" || token == "hid-sticks" ||
+        token == "hid_gimbals" || token == "hid-gimbals") {
+        EnablePlaybackHidRange(mask, 1, 4);
+        return true;
+    }
+    if (token == "sticks" || token == "all" || token == "ch1-4") {
+        for (int ch = 1; ch <= 4; ++ch) {
+            EnablePlaybackChannel(mask, ch);
+        }
+        return true;
+    }
+    if (token == "all8" || token == "ch1-8") {
+        for (int ch = 1; ch <= 8; ++ch) {
+            EnablePlaybackChannel(mask, ch);
+        }
+        return true;
+    }
+    if (token == "ail" || token == "aileron" || token == "roll") {
+        EnablePlaybackChannel(mask, 1);
+        return true;
+    }
+    if (token == "trainer_ail" || token == "trainer-ail" ||
+        token == "trainer_aileron" || token == "trainer-aileron" ||
+        token == "trainer_roll" || token == "trainer-roll" ||
+        token == "final_ail" || token == "final-ail" ||
+        token == "final_aileron" || token == "final-aileron" ||
+        token == "final_roll" || token == "final-roll" ||
+        token == "recorded_ail" || token == "recorded-ail" ||
+        token == "recorded_aileron" || token == "recorded-aileron" ||
+        token == "recorded_roll" || token == "recorded-roll") {
+        EnablePlaybackFinalChannel(mask, 1);
+        return true;
+    }
+    if (token == "radio_ail" || token == "radio-ail" ||
+        token == "radio_aileron" || token == "radio-aileron" ||
+        token == "radio_roll" || token == "radio-roll" ||
+        token == "hid_ail" || token == "hid-ail" ||
+        token == "hid_aileron" || token == "hid-aileron" ||
+        token == "hid_roll" || token == "hid-roll" ||
+        token == "gimbal_ail" || token == "gimbal-ail" ||
+        token == "gimbal_roll" || token == "gimbal-roll") {
+        EnablePlaybackHidChannel(mask, 1);
+        return true;
+    }
+    if (token == "ele" || token == "elev" || token == "elevator" || token == "pitch") {
+        EnablePlaybackChannel(mask, 2);
+        return true;
+    }
+    if (token == "trainer_ele" || token == "trainer-ele" ||
+        token == "trainer_elev" || token == "trainer-elev" ||
+        token == "trainer_elevator" || token == "trainer-elevator" ||
+        token == "trainer_pitch" || token == "trainer-pitch" ||
+        token == "final_ele" || token == "final-ele" ||
+        token == "final_elev" || token == "final-elev" ||
+        token == "final_elevator" || token == "final-elevator" ||
+        token == "final_pitch" || token == "final-pitch" ||
+        token == "recorded_ele" || token == "recorded-ele" ||
+        token == "recorded_elev" || token == "recorded-elev" ||
+        token == "recorded_elevator" || token == "recorded-elevator" ||
+        token == "recorded_pitch" || token == "recorded-pitch") {
+        EnablePlaybackFinalChannel(mask, 2);
+        return true;
+    }
+    if (token == "radio_ele" || token == "radio-ele" ||
+        token == "radio_elev" || token == "radio-elev" ||
+        token == "radio_elevator" || token == "radio-elevator" ||
+        token == "radio_pitch" || token == "radio-pitch" ||
+        token == "hid_ele" || token == "hid-ele" ||
+        token == "hid_elev" || token == "hid-elev" ||
+        token == "hid_elevator" || token == "hid-elevator" ||
+        token == "hid_pitch" || token == "hid-pitch" ||
+        token == "gimbal_ele" || token == "gimbal-ele" ||
+        token == "gimbal_pitch" || token == "gimbal-pitch") {
+        EnablePlaybackHidChannel(mask, 2);
+        return true;
+    }
+    if (token == "trainer_thr" || token == "trainer-thr" ||
+        token == "trainer_throttle" || token == "trainer-throttle" ||
+        token == "final_thr" || token == "final-thr" ||
+        token == "final_throttle" || token == "final-throttle" ||
+        token == "recorded_thr" || token == "recorded-thr" ||
+        token == "recorded_throttle" || token == "recorded-throttle") {
+        EnablePlaybackFinalChannel(mask, 3);
+        return true;
+    }
+    if (token == "radio_thr" || token == "radio-thr" ||
+        token == "radio_throttle" || token == "radio-throttle" ||
+        token == "hid_thr" || token == "hid-thr" ||
+        token == "hid_throttle" || token == "hid-throttle" ||
+        token == "gimbal_thr" || token == "gimbal-thr" ||
+        token == "gimbal_throttle" || token == "gimbal-throttle") {
+        EnablePlaybackHidChannel(mask, 3);
+        return true;
+    }
+    if (token == "thr" || token == "throttle") {
+        EnablePlaybackChannel(mask, 3);
+        return true;
+    }
+    if (token == "mouse_thr" || token == "mouse-thr" ||
+        token == "mouse_throttle" || token == "mouse-throttle" ||
+        token == "pc_thr" || token == "pc-thr" ||
+        token == "pc_throttle" || token == "pc-throttle" ||
+        token == "input_thr" || token == "input-thr" ||
+        token == "input_throttle" || token == "input-throttle") {
+        EnablePlaybackPcInputChannel(mask, 3);
+        return true;
+    }
+    if (token == "trainer_rud" || token == "trainer-rud" ||
+        token == "trainer_rudder" || token == "trainer-rudder" ||
+        token == "trainer_yaw" || token == "trainer-yaw" ||
+        token == "final_rud" || token == "final-rud" ||
+        token == "final_rudder" || token == "final-rudder" ||
+        token == "final_yaw" || token == "final-yaw" ||
+        token == "recorded_rud" || token == "recorded-rud" ||
+        token == "recorded_rudder" || token == "recorded-rudder" ||
+        token == "recorded_yaw" || token == "recorded-yaw") {
+        EnablePlaybackFinalChannel(mask, 4);
+        return true;
+    }
+    if (token == "radio_rud" || token == "radio-rud" ||
+        token == "radio_rudder" || token == "radio-rudder" ||
+        token == "radio_yaw" || token == "radio-yaw" ||
+        token == "hid_rud" || token == "hid-rud" ||
+        token == "hid_rudder" || token == "hid-rudder" ||
+        token == "hid_yaw" || token == "hid-yaw" ||
+        token == "gimbal_rud" || token == "gimbal-rud" ||
+        token == "gimbal_rudder" || token == "gimbal-rudder" ||
+        token == "gimbal_yaw" || token == "gimbal-yaw") {
+        EnablePlaybackHidChannel(mask, 4);
+        return true;
+    }
+    if (token == "rud" || token == "rudder" || token == "yaw") {
+        EnablePlaybackChannel(mask, 4);
+        return true;
+    }
+    if (token == "mouse_rud" || token == "mouse-rud" ||
+        token == "mouse_rudder" || token == "mouse-rudder" ||
+        token == "mouse_yaw" || token == "mouse-yaw" ||
+        token == "pc_rud" || token == "pc-rud" ||
+        token == "pc_rudder" || token == "pc-rudder" ||
+        token == "pc_yaw" || token == "pc-yaw" ||
+        token == "input_rud" || token == "input-rud" ||
+        token == "input_rudder" || token == "input-rudder" ||
+        token == "input_yaw" || token == "input-yaw") {
+        EnablePlaybackPcInputChannel(mask, 4);
+        return true;
+    }
+    if (token.rfind("aux", 0) == 0 && token.size() > 3) {
+        int64_t aux = 0;
+        if (ParseInt64Strict(token.substr(3), &aux) && aux >= 1 && aux <= 12) {
+            EnablePlaybackChannel(mask, static_cast<int>(aux + 4));
+            return true;
+        }
+    }
+    static constexpr const char* kHidChannelPrefixes[] = {
+        "radio_ch", "radio-ch", "hid_ch", "hid-ch", "gimbal_ch", "gimbal-ch"
+    };
+    for (const char* prefix : kHidChannelPrefixes) {
+        const size_t prefix_len = std::strlen(prefix);
+        if (token.rfind(prefix, 0) == 0 && token.size() > prefix_len) {
+            int64_t channel = 0;
+            if (ParseInt64Strict(token.substr(prefix_len), &channel) &&
+                channel >= 1 && channel <= kGx12ChannelCount) {
+                EnablePlaybackHidChannel(mask, static_cast<int>(channel));
+                return true;
+            }
+        }
+    }
+    if (token.rfind("ch", 0) == 0 && token.size() > 2) {
+        int64_t channel = 0;
+        if (ParseInt64Strict(token.substr(2), &channel) &&
+            channel >= 1 && channel <= kSbusChannels) {
+            EnablePlaybackChannel(mask, static_cast<int>(channel));
+            return true;
+        }
+    }
+    int64_t channel = 0;
+    if (ParseInt64Strict(token, &channel) && channel >= 1 && channel <= kSbusChannels) {
+        EnablePlaybackChannel(mask, static_cast<int>(channel));
+        return true;
+    }
+    return false;
+}
+
+bool ParsePlaybackChannelMask(const std::string& text, PlaybackChannelMask* mask) {
+    if (!mask) {
+        return false;
+    }
+    std::string normalized = text;
+    for (char& ch : normalized) {
+        if (ch == '+' || ch == ';' || ch == '|') {
+            ch = ',';
+        }
+    }
+    for (const std::string& token : SplitSimpleCsvLine(normalized)) {
+        if (!EnablePlaybackChannelToken(token, mask)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+PlaybackChannelMask DefaultPlaybackChannelMask() {
+    PlaybackChannelMask mask;
+    EnablePlaybackFinalChannel(&mask, 1);
+    EnablePlaybackFinalChannel(&mask, 2);
+    return mask;
+}
+
+std::string DescribePlaybackChannelMask(const PlaybackChannelMask& mask) {
+    static constexpr const char* pc_names[4] = {"ail", "ele", "thr", "rud"};
+    static constexpr const char* final_names[4] = {"trainer_ail", "trainer_ele", "trainer_thr", "trainer_rud"};
+    static constexpr const char* hid_names[4] = {"radio_ail", "radio_ele", "radio_thr", "radio_rud"};
+    std::string out;
+    for (int ch = 0; ch < kSbusChannels; ++ch) {
+        if (!mask.enabled[static_cast<size_t>(ch)]) {
+            continue;
+        }
+        if (!out.empty()) {
+            out += ",";
+        }
+        if (ch < 4) {
+            const size_t index = static_cast<size_t>(ch);
+            if (mask.use_hid[index]) {
+                out += hid_names[ch];
+            } else if (mask.use_pc_input[index]) {
+                out += pc_names[ch];
+            } else {
+                out += final_names[ch];
+            }
+        } else {
+            out += "ch" + std::to_string(ch + 1);
+        }
+    }
+    return out.empty() ? "none" : out;
+}
+
+bool ParsePlaybackBindOptionName(const std::string& lowered, bool* block_live_input) {
+    if (!block_live_input) {
+        return false;
+    }
+    if (lowered == "--bind" || lowered == "--slot") {
+        *block_live_input = false;
+        return true;
+    }
+    if (lowered == "--bind-block" ||
+        lowered == "--bind-block-live" ||
+        lowered == "--bind-block-input" ||
+        lowered == "--bind-block-radio" ||
+        lowered == "--slot-block" ||
+        lowered == "--slot-block-live") {
+        *block_live_input = true;
+        return true;
+    }
+    return false;
+}
+
+int ParseTriggerVirtualKeyName(const std::string& text) {
+    const std::string token = ToLowerAscii(TrimAscii(text));
+    if (token.empty() || token == "none" || token == "off" || token == "immediate") {
+        return 0;
+    }
+    if (token == "mouse1" || token == "mouse_left" || token == "left_mouse" || token == "lbutton") {
+        return VK_LBUTTON;
+    }
+    if (token == "mouse2" || token == "mouse_right" || token == "right_mouse" || token == "rbutton") {
+        return VK_RBUTTON;
+    }
+    if (token == "mouse3" || token == "mouse_middle" || token == "middle_mouse" || token == "mbutton") {
+        return VK_MBUTTON;
+    }
+    if (token == "mouse4" || token == "xbutton1") {
+        return VK_XBUTTON1;
+    }
+    if (token == "mouse5" || token == "xbutton2") {
+        return VK_XBUTTON2;
+    }
+    return ParseVirtualKeyName(token);
+}
+
+bool ParsePlaybackTrigger(const std::string& text, PlaybackTrigger* trigger) {
+    if (!trigger) {
+        return false;
+    }
+    const std::string token = ToLowerAscii(TrimAscii(text));
+    if (token.empty() || token == "none" || token == "off" || token == "immediate") {
+        *trigger = PlaybackTrigger{};
+        return true;
+    }
+    const int vk = ParseTriggerVirtualKeyName(text);
+    if (vk <= 0) {
+        return false;
+    }
+    trigger->virtual_key = vk;
+    trigger->label = TrimAscii(text);
+    return true;
+}
+
+bool PlaybackTriggerPressed(const PlaybackTrigger& trigger) {
+    return !trigger.Immediate() &&
+           (GetAsyncKeyState(trigger.virtual_key) & 0x8000) != 0;
+}
+
+int WaitForPlaybackTrigger(const PlaybackTrigger& trigger, HANDLE launcher_stop_event) {
+    if (trigger.Immediate()) {
+        return 0;
+    }
+    std::printf("playback armed; press %s to start, Esc to cancel.\n", trigger.label.c_str());
+    std::fflush(stdout);
+    while (true) {
+        if (LauncherStopRequested(launcher_stop_event) || StopKeyDown()) {
+            return 1;
+        }
+        if (PlaybackTriggerPressed(trigger)) {
+            while (PlaybackTriggerPressed(trigger)) {
+                Sleep(5);
+            }
+            return 0;
+        }
+        Sleep(5);
+    }
+}
+
+bool LooksLikeComPortArgument(const std::string& text) {
+    if (_stricmp(text.c_str(), "auto") == 0) {
+        return true;
+    }
+    return text.size() >= 4 &&
+           (text[0] == 'C' || text[0] == 'c') &&
+           (text[1] == 'O' || text[1] == 'o') &&
+           (text[2] == 'M' || text[2] == 'm');
+}
+
+bool ConfigureTrainerSerial(HANDLE serial) {
+    DCB dcb{};
+    dcb.DCBlength = sizeof(dcb);
+    if (!GetCommState(serial, &dcb)) {
+        std::fprintf(stderr, "GetCommState failed: le=%lu\n", static_cast<unsigned long>(GetLastError()));
+        return false;
+    }
+    dcb.BaudRate = CBR_115200;
+    dcb.ByteSize = 8;
+    dcb.Parity = NOPARITY;
+    dcb.StopBits = ONESTOPBIT;
+    if (!SetCommState(serial, &dcb)) {
+        std::fprintf(stderr, "SetCommState failed: le=%lu\n", static_cast<unsigned long>(GetLastError()));
+        return false;
+    }
+
+    COMMTIMEOUTS timeouts{};
+    timeouts.WriteTotalTimeoutConstant = 20;
+    timeouts.WriteTotalTimeoutMultiplier = 1;
+    SetCommTimeouts(serial, &timeouts);
+    return true;
+}
+
+HANDLE OpenTrainerSerialForPlayback(const std::string& requested_port) {
+    const std::string resolved_port = ResolveTrainerPortName(requested_port.c_str());
+    const std::string path = WindowsComPath(resolved_port.c_str());
+    if (path.empty()) {
+        std::fprintf(stderr, "--trainer-playback requires a COM port, for example COM3, or auto.\n");
+        return INVALID_HANDLE_VALUE;
+    }
+
+    HANDLE serial = CreateFileA(path.c_str(),
+                                GENERIC_WRITE,
+                                0,
+                                nullptr,
+                                OPEN_EXISTING,
+                                FILE_ATTRIBUTE_NORMAL,
+                                nullptr);
+    if (serial == INVALID_HANDLE_VALUE) {
+        std::fprintf(stderr,
+                     "CreateFile(%s) failed: le=%lu\n",
+                     path.c_str(),
+                     static_cast<unsigned long>(GetLastError()));
+        return INVALID_HANDLE_VALUE;
+    }
+    if (!ConfigureTrainerSerial(serial)) {
+        CloseHandle(serial);
+        return INVALID_HANDLE_VALUE;
+    }
+    return serial;
+}
+
+bool WriteTrainerFrame(HANDLE serial, const uint8_t* frame, size_t frame_size) {
+    DWORD written = 0;
+    return WriteFile(serial,
+                     frame,
+                     static_cast<DWORD>(frame_size),
+                     &written,
+                     nullptr) &&
+           written == frame_size;
+}
+
+bool SendPlaybackNeutral(HANDLE serial, TrainerResolutionMode mode) {
+    uint8_t neutral[kSbusFrameSize];
+    std::array<int, kSbusChannels> pulses{};
+    pulses[2] = TrainerLowValue(mode);
+    BuildSbusFrame(pulses, kSbusTrainerMaskMarker, mode, neutral);
+    return WriteTrainerFrame(serial, neutral, sizeof(neutral));
+}
+
+uint8_t PlaybackActiveFlags(const PlaybackChannelMask& mask, TrainerResolutionMode mode) {
+    uint8_t flags = kSbusTrainerMaskMarker;
+    if (mask.UsesRightStick()) {
+        flags |= kSbusTrainerMaskRightActive;
+    }
+    if (mask.UsesLeftStick()) {
+        flags |= kSbusTrainerMaskLeftActive;
+    }
+    if (mode == TrainerResolutionMode::Gx12_2x) {
+        flags |= kSbusTrainerResolution2x;
+    }
+    return flags;
+}
+
+bool PlaybackPlainChannelEnabled(const PlaybackChannelMask& mask, int channel_index) {
+    return channel_index >= 0 &&
+           channel_index < kSbusChannels &&
+           mask.enabled[static_cast<size_t>(channel_index)] &&
+           !mask.use_hid[static_cast<size_t>(channel_index)] &&
+           mask.use_pc_input[static_cast<size_t>(channel_index)];
+}
+
+bool PlaybackChannelUsesInputInjection(const PlaybackChannelMask& mask,
+                                       const TrainerProfile& profile,
+                                       int channel_index) {
+    if (!PlaybackPlainChannelEnabled(mask, channel_index)) {
+        return false;
+    }
+    if (channel_index == 0 || channel_index == 1) {
+        return profile.mouse_right_stick_enabled;
+    }
+    if (channel_index == 2 || channel_index == 3) {
+        return profile.mouse_left.enabled || profile.right_mouse_left.enabled;
+    }
+    return false;
+}
+
+const char* PrimaryPlaybackChannelName(int channel_index) {
+    static constexpr const char* names[] = {"ail", "ele", "thr", "rud"};
+    return channel_index >= 0 && channel_index < 4 ? names[channel_index] : "ch";
+}
+
+const char* PrimaryPlaybackHidChannelName(int channel_index) {
+    static constexpr const char* names[] = {
+        "radio_ail", "radio_ele", "radio_thr", "radio_rud"
+    };
+    return channel_index >= 0 && channel_index < 4 ? names[channel_index] : "radio_ch";
+}
+
+const char* PrimaryPlaybackFinalChannelName(int channel_index) {
+    static constexpr const char* names[] = {
+        "trainer_ail", "trainer_ele", "trainer_thr", "trainer_rud"
+    };
+    return channel_index >= 0 && channel_index < 4 ? names[channel_index] : "trainer_ch";
+}
+
+const char* PlaybackPcInputSourceName(int channel_index) {
+    return channel_index == 0 || channel_index == 1
+        ? "PC right-stick mouse"
+        : "PC left-stick mouse/buttons";
+}
+
+bool ResolveIntegratedPlaybackMaskForProfile(PlaybackChannelMask* mask,
+                                             const TrainerProfile& profile,
+                                             const LoadedRecording& recording,
+                                             const std::string& recording_path,
+                                             bool verbose) {
+    if (!mask) {
+        return false;
+    }
+
+    for (int ch = 0; ch < 4; ++ch) {
+        const size_t index = static_cast<size_t>(ch);
+        if (!mask->enabled[index] || !mask->use_pc_input[index] ||
+            PlaybackChannelUsesInputInjection(*mask, profile, ch)) {
+            continue;
+        }
+
+        if (recording.has_hid_samples) {
+            mask->use_pc_input[index] = false;
+            mask->use_hid[index] = true;
+            if (verbose) {
+                std::fprintf(stderr,
+                             "trainer profile playback: %s requested %s replay, "
+                             "but the profile has no matching source; using %s from recorded GX12 HID (%s).\n",
+                             PrimaryPlaybackChannelName(ch),
+                             PlaybackPcInputSourceName(ch),
+                             PrimaryPlaybackHidChannelName(ch),
+                             recording_path.c_str());
+            }
+            continue;
+        }
+
+        if (verbose) {
+            std::fprintf(stderr,
+                         "trainer profile playback error: %s requested %s replay, "
+                         "but the profile has no matching source and the recording has no GX12 HID samples: %s. "
+                         "Use %s for recorded trainer output, or record with a matching PC input source.\n",
+                         PrimaryPlaybackChannelName(ch),
+                         PlaybackPcInputSourceName(ch),
+                         recording_path.c_str(),
+                         PrimaryPlaybackFinalChannelName(ch));
+        }
+        return false;
+    }
+
+    return true;
+}
+
+bool PlaybackMaskAllEnabledChannelsUseInputInjection(const PlaybackChannelMask& mask,
+                                                     const TrainerProfile& profile) {
+    bool any_enabled = false;
+    for (int ch = 0; ch < kSbusChannels; ++ch) {
+        if (!mask.enabled[static_cast<size_t>(ch)]) {
+            continue;
+        }
+        any_enabled = true;
+        if (!PlaybackChannelUsesInputInjection(mask, profile, ch)) {
+            return false;
+        }
+    }
+    return any_enabled;
+}
+
+void AddPlaybackSampleInput(const RecordingSample& sample,
+                            const PlaybackChannelMask& mask,
+                            const TrainerProfile& profile,
+                            PlaybackInputInjection* injection) {
+    if (!injection) {
+        return;
+    }
+
+    if (profile.mouse_right_stick_enabled) {
+        const bool roll = PlaybackChannelUsesInputInjection(mask, profile, 0);
+        const bool pitch = PlaybackChannelUsesInputInjection(mask, profile, 1);
+        if (profile.swap_axes) {
+            if (roll) {
+                injection->right_dy += sample.right_dy;
+            }
+            if (pitch) {
+                injection->right_dx += sample.right_dx;
+            }
+        } else {
+            if (roll) {
+                injection->right_dx += sample.right_dx;
+            }
+            if (pitch) {
+                injection->right_dy += sample.right_dy;
+            }
+        }
+    }
+
+    const bool throttle = PlaybackChannelUsesInputInjection(mask, profile, 2);
+    const bool yaw = PlaybackChannelUsesInputInjection(mask, profile, 3);
+    if (profile.mouse_left.enabled) {
+        if (profile.mouse_left.swap_axes) {
+            if (throttle) {
+                injection->left_dx += sample.left_dx;
+            }
+            if (yaw) {
+                injection->left_dy += sample.left_dy;
+            }
+        } else {
+            if (throttle) {
+                injection->left_dy += sample.left_dy;
+            }
+            if (yaw) {
+                injection->left_dx += sample.left_dx;
+            }
+        }
+    } else if (profile.right_mouse_left.enabled) {
+        if (profile.right_mouse_left.swap_axes) {
+            if (throttle) {
+                injection->right_buttons = sample.right_buttons;
+                injection->right_buttons_valid = true;
+            }
+            if (yaw) {
+                injection->right_wheel_y += sample.right_wheel_y;
+            }
+        } else {
+            if (throttle) {
+                injection->right_wheel_y += sample.right_wheel_y;
+            }
+            if (yaw) {
+                injection->right_buttons = sample.right_buttons;
+                injection->right_buttons_valid = true;
+            }
+        }
+    }
+}
+
+PlaybackInputInjection ConsumePlaybackInputInjection(const PlaybackBankSlot& slot,
+                                                     const TrainerProfile& profile,
+                                                     int64_t playback_elapsed_us,
+                                                     int64_t playback_base_us,
+                                                     size_t* sample_index,
+                                                     bool* have_mapper_tick,
+                                                     uint32_t* last_mapper_tick) {
+    // PC-input playback must follow the mapper update stream, not frame
+    // timestamps. Recorded frame timing can drift when the live mapper misses
+    // scheduler slots; replaying by wall time would insert no-input return
+    // ticks that never happened in the original mapper state.
+    (void)playback_elapsed_us;
+    (void)playback_base_us;
+    PlaybackInputInjection injection;
+    if (!sample_index || !have_mapper_tick || !last_mapper_tick) {
+        return injection;
+    }
+
+    const std::vector<RecordingSample>& samples = slot.recording.samples;
+    while (*sample_index < samples.size()) {
+        const RecordingSample& sample = samples[*sample_index];
+        if (!*have_mapper_tick || sample.mapper_tick != *last_mapper_tick) {
+            AddPlaybackSampleInput(sample, slot.spec.mask, profile, &injection);
+            *last_mapper_tick = sample.mapper_tick;
+            *have_mapper_tick = true;
+            ++injection.mapper_ticks;
+            ++(*sample_index);
+            while (*sample_index < samples.size() &&
+                   samples[*sample_index].mapper_tick == *last_mapper_tick) {
+                ++(*sample_index);
+            }
+            break;
+        }
+        ++(*sample_index);
+    }
+    return injection;
+}
+
+void ApplyPlaybackInputInjection(const PlaybackInputInjection& injection,
+                                 int64_t* right_dx,
+                                 int64_t* right_dy,
+                                 int64_t* right_wheel_x,
+                                 int64_t* right_wheel_y,
+                                 uint32_t* right_buttons,
+                                 int64_t* left_dx,
+                                 int64_t* left_dy,
+                                 int64_t* left_wheel_x,
+                                 int64_t* left_wheel_y,
+                                 uint32_t* left_buttons) {
+    if (right_dx) *right_dx += injection.right_dx;
+    if (right_dy) *right_dy += injection.right_dy;
+    if (right_wheel_x) *right_wheel_x += injection.right_wheel_x;
+    if (right_wheel_y) *right_wheel_y += injection.right_wheel_y;
+    if (right_buttons && injection.right_buttons_valid) {
+        *right_buttons |= injection.right_buttons;
+    }
+    if (left_dx) *left_dx += injection.left_dx;
+    if (left_dy) *left_dy += injection.left_dy;
+    if (left_wheel_x) *left_wheel_x += injection.left_wheel_x;
+    if (left_wheel_y) *left_wheel_y += injection.left_wheel_y;
+    if (left_buttons && injection.left_buttons_valid) {
+        *left_buttons |= injection.left_buttons;
+    }
+}
+
+void ClearPlaybackLiveInputForMask(const PlaybackBankSlotSpec& spec,
+                                   const TrainerProfile& profile,
+                                   int64_t* right_dx,
+                                   int64_t* right_dy,
+                                   int64_t* right_wheel_y,
+                                   uint32_t* right_buttons,
+                                   int64_t* left_dx,
+                                   int64_t* left_dy) {
+    const PlaybackChannelMask& mask = spec.mask;
+    if (profile.mouse_right_stick_enabled) {
+        const bool roll = mask.enabled[0];
+        const bool pitch = mask.enabled[1];
+        if (profile.swap_axes) {
+            if (roll && right_dy) *right_dy = 0;
+            if (pitch && right_dx) *right_dx = 0;
+        } else {
+            if (roll && right_dx) *right_dx = 0;
+            if (pitch && right_dy) *right_dy = 0;
+        }
+    }
+
+    const bool throttle = mask.enabled[2];
+    const bool yaw = mask.enabled[3];
+    if (profile.mouse_left.enabled) {
+        if (profile.mouse_left.swap_axes) {
+            if (throttle && left_dx) *left_dx = 0;
+            if (yaw && left_dy) *left_dy = 0;
+        } else {
+            if (throttle && left_dy) *left_dy = 0;
+            if (yaw && left_dx) *left_dx = 0;
+        }
+    } else if (profile.right_mouse_left.enabled) {
+        if (profile.right_mouse_left.swap_axes) {
+            if (throttle && right_buttons) *right_buttons = 0;
+            if (yaw && right_wheel_y) *right_wheel_y = 0;
+        } else {
+            if (throttle && right_wheel_y) *right_wheel_y = 0;
+            if (yaw && right_buttons) *right_buttons = 0;
+        }
+    }
+}
+
+std::array<int, kSbusChannels> BuildPlaybackPulses(const RecordingSample& sample,
+                                                   const PlaybackChannelMask& mask,
+                                                   TrainerResolutionMode mode) {
+    std::array<int, kSbusChannels> pulses{};
+    pulses[2] = TrainerLowValue(mode);
+    for (int ch = 0; ch < kSbusChannels; ++ch) {
+        if (!mask.enabled[static_cast<size_t>(ch)]) {
+            continue;
+        }
+
+        int value = sample.final_channels[static_cast<size_t>(ch)];
+        if (sample.hid_valid &&
+            mask.use_hid[static_cast<size_t>(ch)] &&
+            ch < kGx12ChannelCount) {
+            value = HidCenteredToTrainerOutput(sample.hid_channels[static_cast<size_t>(ch)], mode);
+        }
+        pulses[static_cast<size_t>(ch)] = ClampTrainerOutput(value, mode);
+    }
+    return pulses;
+}
+
+bool ValidatePlaybackRecordingForCurrentBuild(const LoadedRecording& recording,
+                                              const char* recording_path) {
+    if (recording.metadata.resolution_mode == TrainerResolutionMode::Gx12_2x &&
+        !kGx12Resolution2xBuild) {
+        std::fprintf(stderr,
+                     "--trainer-playback error: gx12_2x recording requires a 2x-capable gx12mouse build: %s\n",
+                     recording_path ? recording_path : "(recording)");
+        return false;
+    }
+    return true;
+}
+
+struct PlaybackRunControl {
+    HANDLE launcher_stop_event = nullptr;
+    const PlaybackTrigger* stop_trigger = nullptr;
+    bool stop_trigger_was_down = false;
+    bool stopped_by_trigger = false;
+};
+
+bool PlaybackRunShouldStop(PlaybackRunControl* control) {
+    const HANDLE launcher_stop_event = control ? control->launcher_stop_event : nullptr;
+    if (LauncherStopRequested(launcher_stop_event) || StopKeyDown()) {
+        return true;
+    }
+
+    if (!control || !control->stop_trigger) {
+        return false;
+    }
+
+    const bool trigger_down = PlaybackTriggerPressed(*control->stop_trigger);
+    if (!trigger_down) {
+        control->stop_trigger_was_down = false;
+        return false;
+    }
+    if (control->stop_trigger_was_down) {
+        return false;
+    }
+
+    control->stop_trigger_was_down = true;
+    control->stopped_by_trigger = true;
+    return true;
+}
+
+bool PlayLoadedRecordingOnce(HANDLE serial,
+                             const LoadedRecording& recording,
+                             const PlaybackChannelMask& mask,
+                             PlaybackRunControl* control,
+                             uint64_t* frames_sent) {
+    using clock = std::chrono::steady_clock;
+    if (control) {
+        control->stopped_by_trigger = false;
+    }
+
+    bool stop_requested = false;
+    const int64_t base_us = recording.samples.front().time_us;
+    const auto playback_start = clock::now();
+    for (const RecordingSample& sample : recording.samples) {
+        if (PlaybackRunShouldStop(control)) {
+            stop_requested = true;
+            break;
+        }
+
+        const int64_t offset_us = std::max<int64_t>(0, sample.time_us - base_us);
+        const auto target = playback_start + std::chrono::microseconds(offset_us);
+        while (clock::now() < target) {
+            if (PlaybackRunShouldStop(control)) {
+                stop_requested = true;
+                break;
+            }
+            const auto remaining =
+                std::chrono::duration_cast<std::chrono::microseconds>(target - clock::now()).count();
+            if (remaining > 2000) {
+                std::this_thread::sleep_for(std::chrono::microseconds(std::min<int64_t>(remaining / 2, 2000)));
+            } else {
+                Sleep(0);
+            }
+        }
+        if (stop_requested) {
+            break;
+        }
+
+        const std::array<int, kSbusChannels> pulses =
+            BuildPlaybackPulses(sample, mask, recording.metadata.resolution_mode);
+        uint8_t frame[kSbusFrameSize];
+        BuildSbusFrame(pulses,
+                       PlaybackActiveFlags(mask, recording.metadata.resolution_mode),
+                       recording.metadata.resolution_mode,
+                       frame);
+        if (!WriteTrainerFrame(serial, frame, sizeof(frame))) {
+            std::fprintf(stderr,
+                         "WriteFile failed after %llu playback frame(s): le=%lu\n",
+                         static_cast<unsigned long long>(frames_sent ? *frames_sent : 0),
+                         static_cast<unsigned long>(GetLastError()));
+            stop_requested = true;
+            break;
+        }
+        if (frames_sent) {
+            ++(*frames_sent);
+        }
+    }
+    return stop_requested;
+}
+
+int RunRecordingInfo(const char* path) {
+    LoadedRecording recording;
+    std::string error;
+    if (!LoadRecordingFile(path, &recording, &error)) {
+        std::fprintf(stderr, "--recording-info failed: %s\n", error.c_str());
+        return 1;
+    }
+
+    const int64_t first_us = recording.samples.front().time_us;
+    const int64_t last_us = recording.samples.back().time_us;
+    const double duration_s = std::max<int64_t>(0, last_us - first_us) / 1000000.0;
+    std::printf("\n--recording-info: %s\n", path);
+    std::printf("  schema=%d app=%s profile=%s hash=%s\n",
+                recording.metadata.schema,
+                recording.metadata.app_version.c_str(),
+                recording.metadata.profile_name.c_str(),
+                recording.metadata.profile_hash.c_str());
+    std::printf("  frame_rate=%d mapper_rate=%d resolution=%s duration=%.3fs samples=%zu hid_rows=%llu hid_samples=%s buffer=%s\n",
+                recording.metadata.trainer_frame_rate_hz,
+                recording.metadata.mapper_rate_hz,
+                TrainerResolutionModeName(recording.metadata.resolution_mode),
+                duration_s,
+                recording.samples.size(),
+                static_cast<unsigned long long>(recording.hid_rows),
+                recording.has_hid_samples ? "yes" : "no",
+                recording.metadata.recording_buffer.c_str());
+    std::printf("  default playback channels: trainer_right uses recorded final ch1/ch2. Use --channels=ail,ele or ail,ele,thr,rud to rerun PC input tracks, or gimbals for radio HID ch1-ch4.\n");
+    return 0;
+}
+
+int RunTrainerPlayback(const char* recording_path,
+                       const std::string& port,
+                       bool loop,
+                       const PlaybackChannelMask& mask,
+                       const PlaybackTrigger& trigger) {
+    if (!mask.Any()) {
+        std::fprintf(stderr, "--trainer-playback needs at least one playback channel.\n");
+        return 2;
+    }
+
+    LoadedRecording recording;
+    std::string error;
+    if (!LoadRecordingFile(recording_path, &recording, &error)) {
+        std::fprintf(stderr, "--trainer-playback failed: %s\n", error.c_str());
+        return 1;
+    }
+    if (!ValidatePlaybackRecordingForCurrentBuild(recording, recording_path)) {
+        return 2;
+    }
+
+    g_stop_virtual_key.store(VK_ESCAPE, std::memory_order_release);
+    HANDLE launcher_stop_event = CreateEventW(nullptr, TRUE, FALSE, kLauncherStopEventName);
+    HANDLE serial = OpenTrainerSerialForPlayback(port);
+    if (serial == INVALID_HANDLE_VALUE) {
+        if (launcher_stop_event) CloseHandle(launcher_stop_event);
+        return 1;
+    }
+
+    (void)SendPlaybackNeutral(serial, recording.metadata.resolution_mode);
+    std::printf("\n--trainer-playback: recording=%s samples=%zu resolution=%s channels=%s mode=%s trigger=%s\n",
+                recording_path,
+                recording.samples.size(),
+                TrainerResolutionModeName(recording.metadata.resolution_mode),
+                DescribePlaybackChannelMask(mask).c_str(),
+                loop ? "loop" : "once",
+                trigger.label.c_str());
+    if (mask.UsesThrottleOrYaw()) {
+        std::printf("WARNING: playback includes recorded throttle/yaw. Keep this sim/bench-only and keep the stop key reachable.\n");
+        if (!recording.has_hid_samples) {
+            std::printf("WARNING: recording has no HID samples; ch3/ch4 will use final trainer rows from the recording.\n");
+        }
+    }
+    if (mask.UsesHidRightStick() && !recording.has_hid_samples) {
+        std::printf("WARNING: radio right-gimbal playback was requested, but this recording has no HID samples; ch1/ch2 will fall back to final trainer rows.\n");
+    }
+    std::printf("Esc or launcher Stop sends neutral and exits.\n");
+
+    if (WaitForPlaybackTrigger(trigger, launcher_stop_event) != 0) {
+        (void)SendPlaybackNeutral(serial, recording.metadata.resolution_mode);
+        CloseHandle(serial);
+        if (launcher_stop_event) CloseHandle(launcher_stop_event);
+        return 0;
+    }
+
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    uint64_t frames_sent = 0;
+    bool stop_requested = false;
+    PlaybackRunControl playback_control;
+    playback_control.launcher_stop_event = launcher_stop_event;
+    do {
+        stop_requested = PlayLoadedRecordingOnce(serial, recording, mask, &playback_control, &frames_sent);
+    } while (loop && !stop_requested);
+
+    (void)SendPlaybackNeutral(serial, recording.metadata.resolution_mode);
+    CloseHandle(serial);
+    if (launcher_stop_event) CloseHandle(launcher_stop_event);
+    std::printf("playback summary: frames=%llu stopped=%s\n",
+                static_cast<unsigned long long>(frames_sent),
+                stop_requested ? "yes" : "no");
+    return 0;
+}
+
+int RunTrainerPlaybackBank(const std::string& port,
+                           bool loop,
+                           const std::vector<PlaybackBankSlotSpec>& specs) {
+    if (specs.empty()) {
+        std::fprintf(stderr, "--trainer-playback-bank needs at least one --bind KEY CHANNELS RECORDING slot.\n");
+        return 2;
+    }
+    if (specs.size() > kMaxPlaybackBankSlots) {
+        std::fprintf(stderr,
+                     "--trainer-playback-bank supports at most %zu binding slots.\n",
+                     kMaxPlaybackBankSlots);
+        return 2;
+    }
+
+    std::vector<PlaybackBankSlot> slots;
+    slots.reserve(specs.size());
+    for (const PlaybackBankSlotSpec& spec : specs) {
+        if (spec.trigger.Immediate()) {
+            std::fprintf(stderr,
+                         "--trainer-playback-bank bind for %s needs a hotkey trigger; immediate is only valid for single playback.\n",
+                         spec.recording_path.c_str());
+            return 2;
+        }
+        if (!spec.mask.Any()) {
+            std::fprintf(stderr,
+                         "--trainer-playback-bank bind for %s needs at least one channel.\n",
+                         spec.recording_path.c_str());
+            return 2;
+        }
+
+        PlaybackBankSlot slot;
+        slot.spec = spec;
+        std::string error;
+        if (!LoadRecordingFile(spec.recording_path.c_str(), &slot.recording, &error)) {
+            std::fprintf(stderr,
+                         "--trainer-playback-bank failed loading %s: %s\n",
+                         spec.recording_path.c_str(),
+                         error.c_str());
+            return 1;
+        }
+        if (!ValidatePlaybackRecordingForCurrentBuild(slot.recording, spec.recording_path.c_str())) {
+            return 2;
+        }
+        slots.push_back(std::move(slot));
+    }
+
+    g_stop_virtual_key.store(VK_ESCAPE, std::memory_order_release);
+    HANDLE launcher_stop_event = CreateEventW(nullptr, TRUE, FALSE, kLauncherStopEventName);
+    HANDLE serial = OpenTrainerSerialForPlayback(port);
+    if (serial == INVALID_HANDLE_VALUE) {
+        if (launcher_stop_event) CloseHandle(launcher_stop_event);
+        return 1;
+    }
+
+    (void)SendPlaybackNeutral(serial, slots.front().recording.metadata.resolution_mode);
+    std::printf("\n--trainer-playback-bank: slots=%zu port=%s mode=%s\n",
+                slots.size(),
+                port.c_str(),
+                loop ? "loop" : "once");
+    for (size_t index = 0; index < slots.size(); ++index) {
+        const PlaybackBankSlot& slot = slots[index];
+        std::printf("  [%zu] key=%s channels=%s live_input=%s samples=%zu resolution=%s recording=%s\n",
+                    index + 1,
+                    slot.spec.trigger.label.c_str(),
+                    DescribePlaybackChannelMask(slot.spec.mask).c_str(),
+                    slot.spec.block_live_input ? "blocked" : "pass",
+                    slot.recording.samples.size(),
+                    TrainerResolutionModeName(slot.recording.metadata.resolution_mode),
+                    slot.spec.recording_path.c_str());
+        if (slot.spec.mask.UsesThrottleOrYaw()) {
+            std::printf("      WARNING: bind includes recorded throttle/yaw; keep this sim/bench-only.\n");
+            if (!slot.recording.has_hid_samples) {
+                std::printf("      WARNING: recording has no HID samples; ch3/ch4 will use final trainer rows.\n");
+            }
+        }
+        if (slot.spec.mask.UsesHidRightStick() && !slot.recording.has_hid_samples) {
+            std::printf("      WARNING: radio right-gimbal playback requested, but recording has no HID samples; ch1/ch2 will fall back to final trainer rows.\n");
+        }
+    }
+    std::printf("Esc or launcher Stop sends neutral and exits. Press a bind key to play that recording; press the active bind again to stop it.\n");
+    std::fflush(stdout);
+
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    std::vector<bool> previous_down(slots.size(), false);
+    uint64_t total_frames = 0;
+    uint64_t playbacks_started = 0;
+    bool stop_requested = false;
+    while (!stop_requested) {
+        if (LauncherStopRequested(launcher_stop_event) || StopKeyDown()) {
+            stop_requested = true;
+            break;
+        }
+
+        for (size_t index = 0; index < slots.size(); ++index) {
+            const bool down = PlaybackTriggerPressed(slots[index].spec.trigger);
+            if (!down) {
+                previous_down[index] = false;
+                continue;
+            }
+            if (previous_down[index]) {
+                continue;
+            }
+
+            previous_down[index] = true;
+            const PlaybackBankSlot& slot = slots[index];
+            ++playbacks_started;
+            std::printf("playback bind %zu start: key=%s recording=%s channels=%s live_input=%s\n",
+                        index + 1,
+                        slot.spec.trigger.label.c_str(),
+                        slot.spec.recording_path.c_str(),
+                        DescribePlaybackChannelMask(slot.spec.mask).c_str(),
+                        slot.spec.block_live_input ? "blocked" : "pass");
+            std::fflush(stdout);
+
+            PlaybackRunControl playback_control;
+            playback_control.launcher_stop_event = launcher_stop_event;
+            playback_control.stop_trigger = &slot.spec.trigger;
+            playback_control.stop_trigger_was_down = true;
+            do {
+                const bool playback_stop_requested = PlayLoadedRecordingOnce(
+                    serial,
+                    slot.recording,
+                    slot.spec.mask,
+                    &playback_control,
+                    &total_frames);
+                if (playback_control.stopped_by_trigger) {
+                    break;
+                }
+                if (playback_stop_requested) {
+                    stop_requested = true;
+                    break;
+                }
+            } while (loop && !stop_requested);
+
+            (void)SendPlaybackNeutral(serial, slot.recording.metadata.resolution_mode);
+            std::printf("playback bind %zu end: total_frames=%llu stopped=%s\n",
+                        index + 1,
+                        static_cast<unsigned long long>(total_frames),
+                        stop_requested ? "yes" : (playback_control.stopped_by_trigger ? "bind" : "no"));
+            std::fflush(stdout);
+            break;
+        }
+
+        Sleep(5);
+    }
+
+    (void)SendPlaybackNeutral(serial, slots.front().recording.metadata.resolution_mode);
+    CloseHandle(serial);
+    if (launcher_stop_event) CloseHandle(launcher_stop_event);
+    std::printf("playback bank summary: playbacks=%llu frames=%llu stopped=%s\n",
+                static_cast<unsigned long long>(playbacks_started),
+                static_cast<unsigned long long>(total_frames),
+                stop_requested ? "yes" : "no");
+    return 0;
+}
+
+struct RecordingPlaybackAuditResult {
+    size_t samples = 0;
+    uint32_t mapper_ticks = 0;
+    int current_max_abs_error = 0;
+    int legacy_timestamp_max_abs_error = 0;
+    uint32_t legacy_timestamp_empty_ticks = 0;
+};
+
+struct AuditRightStickState {
+    double roll_position = 0.0;
+    double pitch_position = 0.0;
+    double filtered_roll = 0.0;
+    double filtered_pitch = 0.0;
+    ElasticAxisState roll_elastic_state;
+    ElasticAxisState pitch_elastic_state;
+    RightStickSharedState shared_state;
+    int roll_pulse = 0;
+    int pitch_pulse = 0;
+};
+
+std::array<int, 2> StepAuditRightStick(const TrainerProfile& profile,
+                                       int64_t dx,
+                                       int64_t dy,
+                                       int mapper_rate_hz,
+                                       AuditRightStickState* state) {
+    if (!state) {
+        return {0, 0};
+    }
+
+    const double mapper_dt = 1.0 / static_cast<double>(mapper_rate_hz);
+    const double gain_scale = TrainerRateGainScale(mapper_rate_hz);
+    const double roll_source = profile.swap_axes
+        ? static_cast<double>(-dy)
+        : static_cast<double>(dx);
+    const double pitch_source = profile.swap_axes
+        ? static_cast<double>(dx)
+        : static_cast<double>(-dy);
+    const bool use_position_mapper = RightStickNeedsPositionMapper(profile);
+    if (use_position_mapper) {
+        const double combined_return_step = profile.constant_return_enabled
+            ? profile.constant_return_rate / static_cast<double>(mapper_rate_hz)
+            : 0.0;
+        const double elastic_return_coefficient = profile.elastic_return_enabled
+            ? profile.elastic_return_coefficient
+            : 0.0;
+        ShapeRightStickPositionPulses(roll_source,
+                                      pitch_source,
+                                      gain_scale,
+                                      combined_return_step,
+                                      elastic_return_coefficient,
+                                      mapper_dt,
+                                      combined_return_step > 0.0 ||
+                                          elastic_return_coefficient > 0.0,
+                                      &state->roll_position,
+                                      &state->pitch_position,
+                                      &state->roll_elastic_state,
+                                      &state->pitch_elastic_state,
+                                      &state->shared_state,
+                                      profile,
+                                      &state->roll_pulse,
+                                      &state->pitch_pulse);
+    } else {
+        double filtered_roll_source = roll_source;
+        double filtered_pitch_source = pitch_source;
+        ApplyRightStickInputPreprocessors(&filtered_roll_source,
+                                          &filtered_pitch_source,
+                                          mapper_dt,
+                                          profile,
+                                          &state->shared_state);
+        const double input_gain = UpdateAdaptiveInputGain(filtered_roll_source,
+                                                          filtered_pitch_source,
+                                                          mapper_dt,
+                                                          profile,
+                                                          &state->shared_state);
+        state->roll_pulse = ShapeTrainerPulse(filtered_roll_source,
+                                              profile.roll_gain * gain_scale * input_gain,
+                                              profile.invert_roll,
+                                              &state->filtered_roll,
+                                              profile);
+        state->pitch_pulse = ShapeTrainerPulse(filtered_pitch_source,
+                                               profile.pitch_gain * gain_scale * input_gain,
+                                               profile.invert_pitch,
+                                               &state->filtered_pitch,
+                                               profile);
+    }
+    return {state->roll_pulse, state->pitch_pulse};
+}
+
+PlaybackInputInjection ConsumeTimestampPlaybackInputInjectionForAudit(const PlaybackBankSlot& slot,
+                                                                      const TrainerProfile& profile,
+                                                                      int64_t playback_elapsed_us,
+                                                                      int64_t playback_base_us,
+                                                                      size_t* sample_index,
+                                                                      bool* have_mapper_tick,
+                                                                      uint32_t* last_mapper_tick) {
+    PlaybackInputInjection injection;
+    if (!sample_index || !have_mapper_tick || !last_mapper_tick) {
+        return injection;
+    }
+
+    const std::vector<RecordingSample>& samples = slot.recording.samples;
+    while (*sample_index < samples.size()) {
+        const RecordingSample& sample = samples[*sample_index];
+        const int64_t sample_offset_us =
+            std::max<int64_t>(0, sample.time_us - playback_base_us);
+        if (sample_offset_us > playback_elapsed_us) {
+            break;
+        }
+
+        if (!*have_mapper_tick || sample.mapper_tick != *last_mapper_tick) {
+            AddPlaybackSampleInput(sample, slot.spec.mask, profile, &injection);
+            *last_mapper_tick = sample.mapper_tick;
+            *have_mapper_tick = true;
+            ++injection.mapper_ticks;
+        }
+        ++(*sample_index);
+    }
+    return injection;
+}
+
+bool RunSyntheticRecordingPlaybackAudit(RecordingPlaybackAuditResult* result,
+                                        std::string* error) {
+    const std::filesystem::path recording_path =
+        std::filesystem::path("logs") / "recording-playback-audit.gx12rec.csv";
+    const std::filesystem::path deviation_path =
+        std::filesystem::path("logs") / "recording-playback-audit-deviation.csv";
+    constexpr int kAuditMapperRateHz = 1000;
+    constexpr int kAuditFrameRateHz = 8000;
+    constexpr int kAuditFramesPerMapperTick = kAuditFrameRateHz / kAuditMapperRateHz;
+    constexpr int kAuditMapperTicks = 360;
+    constexpr int64_t kAuditFrameSpacingUs = 1000000 / kAuditFrameRateHz;
+    constexpr int64_t kAuditRecordedMapperSpacingUs = 1100;
+
+    TrainerProfile profile;
+    profile.name = "recording-playback-audit";
+    profile.source_file = "recording-playback-audit";
+    profile.frame_rate_hz = kAuditFrameRateHz;
+    profile.resolution_mode = TrainerResolutionMode::Gx12_2x;
+    profile.mouse_right_stick_enabled = true;
+    profile.roll_gain = 0.3;
+    profile.pitch_gain = 0.3;
+    profile.max_output = 512;
+    profile.deadband = 0;
+    profile.expo = 0.0;
+    profile.smoothing = 0.0;
+    profile.invert_roll = false;
+    profile.invert_pitch = false;
+    profile.swap_axes = false;
+    profile.constant_return_enabled = false;
+    profile.constant_return_rate = 0.0;
+    profile.elastic_return_enabled = true;
+    profile.elastic_return_mode = ElasticReturnMode::Linear;
+    profile.elastic_return_coefficient = 12.0;
+    profile.elastic_return_curve = 0.0;
+    profile.output_curve = OutputCurveMode::Expo;
+    profile.position_model = PositionModel::Integrator;
+    profile.input_gain_mode = InputGainMode::Flat;
+    profile.gate_shape = GateShape::Axis;
+    profile.input_filter = InputFilterMode::Off;
+    profile.despike_enabled = false;
+    profile.despike_count_enabled = false;
+
+    Gx12RecordingHidCapture fake_hid;
+    RecordingCsvWriter writer;
+    if (!writer.Open(profile, recording_path.string().c_str(), kAuditMapperRateHz, fake_hid)) {
+        if (error) *error = "failed to open synthetic audit recording";
+        return false;
+    }
+
+    std::vector<int64_t> input_dx;
+    std::vector<int64_t> input_dy;
+    std::vector<std::array<int, 2>> expected_outputs;
+    input_dx.reserve(kAuditMapperTicks);
+    input_dy.reserve(kAuditMapperTicks);
+    expected_outputs.reserve(kAuditMapperTicks);
+
+    AuditRightStickState expected_state;
+    for (int tick = 0; tick < kAuditMapperTicks; ++tick) {
+        const int64_t dx = tick < 130 ? 4 : (tick >= 210 && tick < 285 ? -3 : 0);
+        const int64_t dy = (tick >= 45 && tick < 115) ? 2 : 0;
+        const std::array<int, 2> expected =
+            StepAuditRightStick(profile, dx, dy, kAuditMapperRateHz, &expected_state);
+        input_dx.push_back(dx);
+        input_dy.push_back(dy);
+        expected_outputs.push_back(expected);
+
+        std::array<int, kSbusChannels> final_channels{};
+        final_channels[0] = expected[0];
+        final_channels[1] = expected[1];
+        final_channels[2] = TrainerLowValue(profile.resolution_mode);
+        final_channels[3] = 0;
+        for (int frame = 0; frame < kAuditFramesPerMapperTick; ++frame) {
+            const int64_t time_us =
+                (static_cast<int64_t>(tick) * kAuditRecordedMapperSpacingUs) +
+                (static_cast<int64_t>(frame) * kAuditFrameSpacingUs);
+            writer.WriteSample(time_us,
+                               static_cast<uint32_t>(tick * kAuditFramesPerMapperTick + frame + 1),
+                               static_cast<uint32_t>(tick + 1),
+                               static_cast<uint64_t>(tick + 1),
+                               static_cast<uint64_t>(tick + 1),
+                               0,
+                               dx,
+                               dy,
+                               0,
+                               0,
+                               0,
+                               0,
+                               0,
+                               0,
+                               0,
+                               0,
+                               final_channels,
+                               fake_hid,
+                               kSbusTrainerMaskMarker,
+                               0);
+        }
+    }
+    writer.Close();
+
+    LoadedRecording loaded;
+    std::string load_error;
+    if (!LoadRecordingFile(recording_path.string().c_str(), &loaded, &load_error)) {
+        if (error) *error = "failed to load synthetic audit recording: " + load_error;
+        return false;
+    }
+
+    PlaybackChannelMask right_mask;
+    ClearPlaybackChannelMask(&right_mask);
+    if (!ParsePlaybackChannelMask("ail,ele", &right_mask)) {
+        if (error) *error = "failed to parse synthetic audit channel mask";
+        return false;
+    }
+
+    PlaybackBankSlot slot;
+    slot.spec.mask = right_mask;
+    slot.recording = loaded;
+    slot.loaded = true;
+
+    std::vector<std::array<int, 2>> current_outputs;
+    std::vector<std::array<int, 2>> legacy_outputs;
+    current_outputs.reserve(kAuditMapperTicks);
+    legacy_outputs.reserve(kAuditMapperTicks);
+
+    int current_max_abs_error = 0;
+    size_t current_index = 0;
+    bool current_have_tick = false;
+    uint32_t current_last_tick = 0;
+    AuditRightStickState current_state;
+    for (int tick = 0; tick < kAuditMapperTicks; ++tick) {
+        const PlaybackInputInjection injection =
+            ConsumePlaybackInputInjection(slot,
+                                          profile,
+                                          static_cast<int64_t>(tick) * 1000,
+                                          loaded.samples.front().time_us,
+                                          &current_index,
+                                          &current_have_tick,
+                                          &current_last_tick);
+        const std::array<int, 2> output =
+            StepAuditRightStick(profile,
+                                injection.right_dx,
+                                injection.right_dy,
+                                kAuditMapperRateHz,
+                                &current_state);
+        current_outputs.push_back(output);
+        current_max_abs_error = std::max(current_max_abs_error,
+                                         std::abs(output[0] - expected_outputs[tick][0]));
+        current_max_abs_error = std::max(current_max_abs_error,
+                                         std::abs(output[1] - expected_outputs[tick][1]));
+    }
+
+    int legacy_max_abs_error = 0;
+    uint32_t legacy_empty_ticks = 0;
+    size_t legacy_index = 0;
+    bool legacy_have_tick = false;
+    uint32_t legacy_last_tick = 0;
+    AuditRightStickState legacy_state;
+    for (int tick = 0; tick < kAuditMapperTicks; ++tick) {
+        const PlaybackInputInjection injection =
+            ConsumeTimestampPlaybackInputInjectionForAudit(slot,
+                                                           profile,
+                                                           static_cast<int64_t>(tick) * 1000,
+                                                           loaded.samples.front().time_us,
+                                                           &legacy_index,
+                                                           &legacy_have_tick,
+                                                           &legacy_last_tick);
+        if (injection.mapper_ticks == 0 && legacy_index < loaded.samples.size()) {
+            ++legacy_empty_ticks;
+        }
+        const std::array<int, 2> output =
+            StepAuditRightStick(profile,
+                                injection.right_dx,
+                                injection.right_dy,
+                                kAuditMapperRateHz,
+                                &legacy_state);
+        legacy_outputs.push_back(output);
+        legacy_max_abs_error = std::max(legacy_max_abs_error,
+                                        std::abs(output[0] - expected_outputs[tick][0]));
+        legacy_max_abs_error = std::max(legacy_max_abs_error,
+                                        std::abs(output[1] - expected_outputs[tick][1]));
+    }
+
+    std::ofstream deviation(deviation_path, std::ios::out | std::ios::trunc);
+    if (!deviation) {
+        if (error) *error = "failed to open synthetic audit deviation output";
+        return false;
+    }
+    deviation << "tick,input_dx,input_dy,expected_roll,expected_pitch,"
+                 "current_roll,current_pitch,legacy_timestamp_roll,legacy_timestamp_pitch,"
+                 "current_abs_error,legacy_timestamp_abs_error\n";
+    for (int tick = 0; tick < kAuditMapperTicks; ++tick) {
+        const int current_error = std::max(
+            std::abs(current_outputs[tick][0] - expected_outputs[tick][0]),
+            std::abs(current_outputs[tick][1] - expected_outputs[tick][1]));
+        const int legacy_error = std::max(
+            std::abs(legacy_outputs[tick][0] - expected_outputs[tick][0]),
+            std::abs(legacy_outputs[tick][1] - expected_outputs[tick][1]));
+        deviation << tick << ','
+                  << input_dx[tick] << ','
+                  << input_dy[tick] << ','
+                  << expected_outputs[tick][0] << ','
+                  << expected_outputs[tick][1] << ','
+                  << current_outputs[tick][0] << ','
+                  << current_outputs[tick][1] << ','
+                  << legacy_outputs[tick][0] << ','
+                  << legacy_outputs[tick][1] << ','
+                  << current_error << ','
+                  << legacy_error << '\n';
+    }
+
+    if (result) {
+        result->samples = loaded.samples.size();
+        result->mapper_ticks = kAuditMapperTicks;
+        result->current_max_abs_error = current_max_abs_error;
+        result->legacy_timestamp_max_abs_error = legacy_max_abs_error;
+        result->legacy_timestamp_empty_ticks = legacy_empty_ticks;
+    }
+    return true;
+}
+
+constexpr uint64_t kFnv1aOffset = 1469598103934665603ULL;
+constexpr uint64_t kFnv1aPrime = 1099511628211ULL;
+
+void HashAppendByte(uint64_t* hash, uint8_t value) {
+    if (!hash) {
+        return;
+    }
+    *hash ^= value;
+    *hash *= kFnv1aPrime;
+}
+
+void HashAppendU64(uint64_t* hash, uint64_t value) {
+    for (int shift = 0; shift < 64; shift += 8) {
+        HashAppendByte(hash, static_cast<uint8_t>((value >> shift) & 0xFFU));
+    }
+}
+
+void HashAppendI64(uint64_t* hash, int64_t value) {
+    HashAppendU64(hash, static_cast<uint64_t>(value));
+}
+
+void HashAppendPulses(uint64_t* hash,
+                      const std::array<int, kSbusChannels>& pulses,
+                      uint8_t flags) {
+    for (int value : pulses) {
+        HashAppendI64(hash, static_cast<int64_t>(value));
+    }
+    HashAppendByte(hash, flags);
+}
+
+bool RightReplayFieldsMatchForMapperTick(const RecordingSample& a,
+                                         const RecordingSample& b) {
+    return a.right_dx == b.right_dx &&
+           a.right_dy == b.right_dy &&
+           a.final_channels[0] == b.final_channels[0] &&
+           a.final_channels[1] == b.final_channels[1];
+}
+
+bool LeftReplayFieldsMatchForMapperTick(const RecordingSample& a,
+                                        const RecordingSample& b) {
+    return a.left_dx == b.left_dx &&
+           a.left_dy == b.left_dy &&
+           a.right_wheel_y == b.right_wheel_y &&
+           a.right_buttons == b.right_buttons &&
+           a.final_channels[2] == b.final_channels[2] &&
+           a.final_channels[3] == b.final_channels[3];
+}
+
+bool HidReplayFieldsMatchForMapperTick(const RecordingSample& a,
+                                       const RecordingSample& b) {
+    return a.hid_valid == b.hid_valid &&
+           (!a.hid_valid ||
+            (a.hid_buttons == b.hid_buttons &&
+             a.hid_channels == b.hid_channels));
+}
+
+struct RecordingDeterminismStaticSummary {
+    size_t samples = 0;
+    size_t unique_mapper_ticks = 0;
+    uint64_t mapper_tick_gaps = 0;
+    uint64_t right_duplicate_tick_mismatches = 0;
+    uint64_t left_duplicate_tick_mismatches = 0;
+    uint64_t hid_duplicate_tick_mismatches = 0;
+    std::array<uint64_t, 33> rows_per_mapper_tick{};
+    uint64_t rows_per_mapper_tick_overflow = 0;
+    int64_t max_late_us = 0;
+    uint64_t late_rows_gt_1000us = 0;
+};
+
+RecordingDeterminismStaticSummary SummarizeRecordingDeterminism(
+    const LoadedRecording& recording) {
+    RecordingDeterminismStaticSummary summary;
+    summary.samples = recording.samples.size();
+    if (recording.samples.empty()) {
+        return summary;
+    }
+
+    size_t index = 0;
+    bool have_previous_tick = false;
+    uint32_t previous_tick = 0;
+    while (index < recording.samples.size()) {
+        const RecordingSample& first = recording.samples[index];
+        const uint32_t tick = first.mapper_tick;
+        if (have_previous_tick && tick > previous_tick + 1U) {
+            summary.mapper_tick_gaps += static_cast<uint64_t>(tick - previous_tick - 1U);
+        }
+        have_previous_tick = true;
+        previous_tick = tick;
+        ++summary.unique_mapper_ticks;
+
+        bool right_mismatch = false;
+        bool left_mismatch = false;
+        bool hid_mismatch = false;
+        size_t rows_for_tick = 0;
+        while (index < recording.samples.size() &&
+               recording.samples[index].mapper_tick == tick) {
+            const RecordingSample& sample = recording.samples[index];
+            if (!RightReplayFieldsMatchForMapperTick(first, sample)) {
+                right_mismatch = true;
+            }
+            if (!LeftReplayFieldsMatchForMapperTick(first, sample)) {
+                left_mismatch = true;
+            }
+            if (!HidReplayFieldsMatchForMapperTick(first, sample)) {
+                hid_mismatch = true;
+            }
+            summary.max_late_us = std::max<int64_t>(summary.max_late_us, sample.late_us);
+            if (sample.late_us > 1000) {
+                ++summary.late_rows_gt_1000us;
+            }
+            ++rows_for_tick;
+            ++index;
+        }
+
+        if (right_mismatch) {
+            ++summary.right_duplicate_tick_mismatches;
+        }
+        if (left_mismatch) {
+            ++summary.left_duplicate_tick_mismatches;
+        }
+        if (hid_mismatch) {
+            ++summary.hid_duplicate_tick_mismatches;
+        }
+        if (rows_for_tick < summary.rows_per_mapper_tick.size()) {
+            ++summary.rows_per_mapper_tick[rows_for_tick];
+        } else {
+            ++summary.rows_per_mapper_tick_overflow;
+        }
+    }
+    return summary;
+}
+
+std::string FormatRowsPerMapperTick(
+    const RecordingDeterminismStaticSummary& summary) {
+    std::ostringstream out;
+    bool first = true;
+    for (size_t rows = 0; rows < summary.rows_per_mapper_tick.size(); ++rows) {
+        const uint64_t ticks = summary.rows_per_mapper_tick[rows];
+        if (ticks == 0) {
+            continue;
+        }
+        if (!first) {
+            out << ',';
+        }
+        first = false;
+        out << rows << ':' << ticks;
+    }
+    if (summary.rows_per_mapper_tick_overflow > 0) {
+        if (!first) {
+            out << ',';
+        }
+        out << "overflow:" << summary.rows_per_mapper_tick_overflow;
+    }
+    return out.str();
+}
+
+struct MapperReplayAuditSummary {
+    uint64_t replay_hash = kFnv1aOffset;
+    size_t input_ticks = 0;
+    uint64_t right_compare_ticks = 0;
+    uint64_t right_mismatches = 0;
+    int right_max_abs_error = 0;
+    uint64_t left_compare_ticks = 0;
+    uint64_t left_mismatches = 0;
+    int left_max_abs_error = 0;
+    uint64_t hid_compare_ticks = 0;
+    uint64_t hid_missing_ticks = 0;
+    bool have_first_right_mismatch = false;
+    uint32_t first_right_mismatch_tick = 0;
+    int first_expected_roll = 0;
+    int first_expected_pitch = 0;
+    int first_replayed_roll = 0;
+    int first_replayed_pitch = 0;
+    bool have_first_left_mismatch = false;
+    uint32_t first_left_mismatch_tick = 0;
+    int first_expected_throttle = 0;
+    int first_expected_yaw = 0;
+    int first_replayed_throttle = 0;
+    int first_replayed_yaw = 0;
+};
+
+MapperReplayAuditSummary AuditMapperReplayFromCleanStart(
+    const TrainerProfile& profile,
+    const LoadedRecording& recording,
+    const PlaybackChannelMask& mask) {
+    MapperReplayAuditSummary summary;
+    PlaybackBankSlot slot;
+    slot.spec.mask = mask;
+    slot.recording = recording;
+    slot.loaded = true;
+
+    size_t input_sample_index = 0;
+    bool have_mapper_tick = false;
+    uint32_t last_mapper_tick = 0;
+    AuditRightStickState right_state;
+    if (recording.metadata.start_state.right_mapper_available) {
+        right_state.roll_position = recording.metadata.start_state.right_roll_value;
+        right_state.pitch_position = recording.metadata.start_state.right_pitch_value;
+        right_state.filtered_roll = recording.metadata.start_state.right_roll_value;
+        right_state.filtered_pitch = recording.metadata.start_state.right_pitch_value;
+        right_state.roll_elastic_state.velocity =
+            recording.metadata.start_state.right_roll_velocity;
+        right_state.pitch_elastic_state.velocity =
+            recording.metadata.start_state.right_pitch_velocity;
+        right_state.roll_pulse = recording.metadata.start_state.right_roll_pulse;
+        right_state.pitch_pulse = recording.metadata.start_state.right_pitch_pulse;
+    }
+    int last_roll = right_state.roll_pulse;
+    int last_pitch = right_state.pitch_pulse;
+    LeftStickPlaybackState left_state =
+        MakeLeftStickPlaybackStateFromRecording(profile, recording.metadata.start_state);
+    int last_throttle = left_state.throttle_pulse;
+    int last_yaw = left_state.yaw_pulse;
+    const int mapper_rate_hz = std::min(profile.frame_rate_hz, kTrainerMapperReferenceHz);
+    const int64_t playback_base_us = recording.samples.front().time_us;
+    const bool compare_roll = PlaybackChannelUsesInputInjection(mask, profile, 0);
+    const bool compare_pitch = PlaybackChannelUsesInputInjection(mask, profile, 1);
+    const bool compare_throttle = PlaybackChannelUsesInputInjection(mask, profile, 2);
+    const bool compare_yaw = PlaybackChannelUsesInputInjection(mask, profile, 3);
+    const bool compare_left = compare_throttle || compare_yaw;
+
+    while (input_sample_index < recording.samples.size()) {
+        const size_t source_index = input_sample_index;
+        const PlaybackInputInjection injection =
+            ConsumePlaybackInputInjection(slot,
+                                          profile,
+                                          0,
+                                          playback_base_us,
+                                          &input_sample_index,
+                                          &have_mapper_tick,
+                                          &last_mapper_tick);
+        if (injection.mapper_ticks == 0 || source_index >= recording.samples.size()) {
+            break;
+        }
+
+        const RecordingSample& source_sample = recording.samples[source_index];
+        if (profile.mouse_right_stick_enabled) {
+            const std::array<int, 2> right_output =
+                StepAuditRightStick(profile,
+                                    injection.right_dx,
+                                    injection.right_dy,
+                                    mapper_rate_hz,
+                                    &right_state);
+            last_roll = right_output[0];
+            last_pitch = right_output[1];
+        }
+        if (profile.mouse_left.enabled || profile.right_mouse_left.enabled) {
+            StepLeftStickPlaybackState(profile,
+                                       injection,
+                                       mapper_rate_hz,
+                                       &left_state);
+            last_throttle = left_state.throttle_pulse;
+            last_yaw = left_state.yaw_pulse;
+        }
+
+        std::array<int, kSbusChannels> pulses{};
+        pulses[0] = last_roll;
+        pulses[1] = last_pitch;
+        pulses[2] = last_throttle;
+        pulses[3] = last_yaw;
+        const std::array<int, kSbusChannels> playback_pulses =
+            BuildPlaybackPulses(source_sample, mask, profile.resolution_mode);
+        for (int ch = 0; ch < kSbusChannels; ++ch) {
+            if (mask.enabled[static_cast<size_t>(ch)] &&
+                !PlaybackChannelUsesInputInjection(mask, profile, ch)) {
+                pulses[static_cast<size_t>(ch)] = playback_pulses[static_cast<size_t>(ch)];
+            }
+        }
+        HashAppendPulses(&summary.replay_hash,
+                         pulses,
+                         PlaybackActiveFlags(mask, profile.resolution_mode));
+        ++summary.input_ticks;
+
+        if (compare_roll || compare_pitch) {
+            ++summary.right_compare_ticks;
+            int tick_error = 0;
+            if (compare_roll) {
+                tick_error = std::max(tick_error,
+                                      std::abs(last_roll - source_sample.final_channels[0]));
+            }
+            if (compare_pitch) {
+                tick_error = std::max(tick_error,
+                                      std::abs(last_pitch - source_sample.final_channels[1]));
+            }
+            if (tick_error != 0) {
+                ++summary.right_mismatches;
+                summary.right_max_abs_error =
+                    std::max(summary.right_max_abs_error, tick_error);
+                if (!summary.have_first_right_mismatch) {
+                    summary.have_first_right_mismatch = true;
+                    summary.first_right_mismatch_tick = source_sample.mapper_tick;
+                    summary.first_expected_roll = source_sample.final_channels[0];
+                    summary.first_expected_pitch = source_sample.final_channels[1];
+                    summary.first_replayed_roll = last_roll;
+                    summary.first_replayed_pitch = last_pitch;
+                }
+            }
+        }
+        if (compare_left) {
+            ++summary.left_compare_ticks;
+            int tick_error = 0;
+            if (compare_throttle) {
+                tick_error = std::max(
+                    tick_error,
+                    std::abs(last_throttle - source_sample.final_channels[2]));
+            }
+            if (compare_yaw) {
+                tick_error = std::max(
+                    tick_error,
+                    std::abs(last_yaw - source_sample.final_channels[3]));
+            }
+            if (tick_error != 0) {
+                ++summary.left_mismatches;
+                summary.left_max_abs_error =
+                    std::max(summary.left_max_abs_error, tick_error);
+                if (!summary.have_first_left_mismatch) {
+                    summary.have_first_left_mismatch = true;
+                    summary.first_left_mismatch_tick = source_sample.mapper_tick;
+                    summary.first_expected_throttle = source_sample.final_channels[2];
+                    summary.first_expected_yaw = source_sample.final_channels[3];
+                    summary.first_replayed_throttle = last_throttle;
+                    summary.first_replayed_yaw = last_yaw;
+                }
+            }
+        }
+        for (int ch = 0; ch < 4; ++ch) {
+            if (!mask.enabled[static_cast<size_t>(ch)] ||
+                !mask.use_hid[static_cast<size_t>(ch)]) {
+                continue;
+            }
+            ++summary.hid_compare_ticks;
+            if (!source_sample.hid_valid) {
+                ++summary.hid_missing_ticks;
+            }
+        }
+    }
+    return summary;
+}
+
+struct TimedPlaybackAuditRun {
+    uint64_t frame_hash = kFnv1aOffset;
+    uint64_t frames = 0;
+    uint64_t input_ticks = 0;
+    uint64_t mapper_ticks = 0;
+    int64_t max_late_us = 0;
+    uint64_t late_frames_gt_1000us = 0;
+    double elapsed_seconds = 0.0;
+    int frames_per_mapper_tick = 0;
+    bool normalized_overlay_clock = false;
+    bool timed_out = false;
+};
+
+TimedPlaybackAuditRun RunTimedIntegratedPlaybackAuditOnce(
+    const TrainerProfile& profile,
+    const LoadedRecording& recording,
+    const PlaybackChannelMask& mask) {
+    TimedPlaybackAuditRun run;
+    PlaybackBankSlot slot;
+    slot.spec.mask = mask;
+    slot.recording = recording;
+    slot.mapper_tick_sample_indices =
+        BuildPlaybackMapperTickSampleIndices(slot.recording);
+    slot.loaded = true;
+
+    const int frame_rate_hz = profile.frame_rate_hz;
+    const int mapper_rate_hz = std::min(frame_rate_hz, kTrainerMapperReferenceHz);
+    const int64_t playback_base_us = recording.samples.front().time_us;
+
+    const bool playback_uses_right_input =
+        PlaybackChannelUsesInputInjection(mask, profile, 0) ||
+        PlaybackChannelUsesInputInjection(mask, profile, 1);
+    const bool playback_uses_left_input =
+        PlaybackChannelUsesInputInjection(mask, profile, 2) ||
+        PlaybackChannelUsesInputInjection(mask, profile, 3);
+    const bool uses_frame_clocked_input =
+        playback_uses_right_input || playback_uses_left_input;
+    const int frames_per_mapper_tick =
+        (PlaybackMaskUsesOnlyRecordedOverlay(mask) || uses_frame_clocked_input)
+            ? PlaybackFramesPerRecordedMapperTick(profile, recording)
+            : 0;
+    if (frames_per_mapper_tick > 0 &&
+        !slot.mapper_tick_sample_indices.empty()) {
+        run.normalized_overlay_clock = true;
+        run.frames_per_mapper_tick = frames_per_mapper_tick;
+        run.mapper_ticks = slot.mapper_tick_sample_indices.size();
+        size_t input_sample_index = 0;
+        bool have_mapper_tick = false;
+        uint32_t last_mapper_tick = 0;
+        RightStickPlaybackState right_state =
+            MakeRightStickPlaybackStateFromRecording(recording.metadata.start_state);
+        LeftStickPlaybackState left_state =
+            MakeLeftStickPlaybackStateFromRecording(profile, recording.metadata.start_state);
+        for (size_t tick_index = 0;
+             tick_index < slot.mapper_tick_sample_indices.size();
+             ++tick_index) {
+            const RecordingSample& playback_sample =
+                recording.samples[slot.mapper_tick_sample_indices[tick_index]];
+            if (uses_frame_clocked_input) {
+                while (input_sample_index < recording.samples.size() &&
+                       (!have_mapper_tick ||
+                        last_mapper_tick != playback_sample.mapper_tick)) {
+                    const size_t before_index = input_sample_index;
+                    const PlaybackInputInjection injection =
+                        ConsumePlaybackInputInjection(slot,
+                                                      profile,
+                                                      0,
+                                                      playback_base_us,
+                                                      &input_sample_index,
+                                                      &have_mapper_tick,
+                                                      &last_mapper_tick);
+                    if (injection.mapper_ticks == 0 || input_sample_index == before_index) {
+                        break;
+                    }
+                    if (playback_uses_right_input && profile.mouse_right_stick_enabled) {
+                        StepRightStickPlaybackState(profile,
+                                                    injection.right_dx,
+                                                    injection.right_dy,
+                                                    mapper_rate_hz,
+                                                    &right_state);
+                    }
+                    if (playback_uses_left_input &&
+                        (profile.mouse_left.enabled || profile.right_mouse_left.enabled)) {
+                        StepLeftStickPlaybackState(profile,
+                                                   injection,
+                                                   mapper_rate_hz,
+                                                   &left_state);
+                    }
+                    run.input_ticks += injection.mapper_ticks;
+                    if (last_mapper_tick == playback_sample.mapper_tick) {
+                        break;
+                    }
+                }
+            }
+            std::array<int, kSbusChannels> pulses{};
+            pulses[0] = right_state.roll_pulse;
+            pulses[1] = right_state.pitch_pulse;
+            pulses[2] = left_state.throttle_pulse;
+            pulses[3] = left_state.yaw_pulse;
+            const std::array<int, kSbusChannels> playback_pulses =
+                BuildPlaybackPulses(playback_sample,
+                                    mask,
+                                    profile.resolution_mode);
+            for (int ch = 0; ch < kSbusChannels; ++ch) {
+                if (mask.enabled[static_cast<size_t>(ch)] &&
+                    !PlaybackChannelUsesInputInjection(mask, profile, ch)) {
+                    pulses[static_cast<size_t>(ch)] =
+                        playback_pulses[static_cast<size_t>(ch)];
+                }
+            }
+            for (int repeat = 0; repeat < frames_per_mapper_tick; ++repeat) {
+                HashAppendPulses(&run.frame_hash,
+                                 pulses,
+                                 PlaybackActiveFlags(mask,
+                                                     profile.resolution_mode));
+                ++run.frames;
+            }
+        }
+        run.elapsed_seconds = frame_rate_hz > 0
+            ? static_cast<double>(run.frames) / static_cast<double>(frame_rate_hz)
+            : 0.0;
+        return run;
+    }
+
+    size_t input_sample_index = 0;
+    bool have_mapper_tick = false;
+    uint32_t last_mapper_tick = 0;
+    RightStickPlaybackState right_state =
+        MakeRightStickPlaybackStateFromRecording(recording.metadata.start_state);
+    int last_roll = right_state.roll_pulse;
+    int last_pitch = right_state.pitch_pulse;
+    LeftStickPlaybackState left_state =
+        MakeLeftStickPlaybackStateFromRecording(profile, recording.metadata.start_state);
+    int last_throttle = left_state.throttle_pulse;
+    int last_yaw = left_state.yaw_pulse;
+
+    for (size_t playback_sample_index = 0;
+         playback_sample_index < recording.samples.size();
+         ++playback_sample_index) {
+        const RecordingSample& playback_sample = recording.samples[playback_sample_index];
+        while (input_sample_index < recording.samples.size() &&
+               (!have_mapper_tick ||
+                last_mapper_tick != playback_sample.mapper_tick)) {
+            const size_t before_index = input_sample_index;
+            const PlaybackInputInjection injection =
+                ConsumePlaybackInputInjection(slot,
+                                              profile,
+                                              0,
+                                              playback_base_us,
+                                              &input_sample_index,
+                                              &have_mapper_tick,
+                                              &last_mapper_tick);
+            if (injection.mapper_ticks == 0 || input_sample_index == before_index) {
+                break;
+            }
+            if (playback_uses_right_input && profile.mouse_right_stick_enabled) {
+                StepRightStickPlaybackState(profile,
+                                            injection.right_dx,
+                                            injection.right_dy,
+                                            mapper_rate_hz,
+                                            &right_state);
+                last_roll = right_state.roll_pulse;
+                last_pitch = right_state.pitch_pulse;
+            }
+            if (playback_uses_left_input &&
+                (profile.mouse_left.enabled || profile.right_mouse_left.enabled)) {
+                StepLeftStickPlaybackState(profile,
+                                           injection,
+                                           mapper_rate_hz,
+                                           &left_state);
+                last_throttle = left_state.throttle_pulse;
+                last_yaw = left_state.yaw_pulse;
+            }
+            run.input_ticks += injection.mapper_ticks;
+            if (last_mapper_tick == playback_sample.mapper_tick) {
+                break;
+            }
+        }
+
+        std::array<int, kSbusChannels> pulses{};
+        pulses[0] = last_roll;
+        pulses[1] = last_pitch;
+        pulses[2] = last_throttle;
+        pulses[3] = last_yaw;
+        const std::array<int, kSbusChannels> playback_pulses =
+            BuildPlaybackPulses(playback_sample,
+                                mask,
+                                profile.resolution_mode);
+        for (int ch = 0; ch < kSbusChannels; ++ch) {
+            if (mask.enabled[static_cast<size_t>(ch)] &&
+                !PlaybackChannelUsesInputInjection(mask, profile, ch)) {
+                pulses[static_cast<size_t>(ch)] =
+                    playback_pulses[static_cast<size_t>(ch)];
+            }
+        }
+
+        HashAppendPulses(&run.frame_hash,
+                         pulses,
+                         PlaybackActiveFlags(mask, profile.resolution_mode));
+        ++run.frames;
+    }
+
+    run.elapsed_seconds = frame_rate_hz > 0
+        ? static_cast<double>(run.frames) / static_cast<double>(frame_rate_hz)
+        : 0.0;
+    return run;
+}
+
+int RunRecordingDeterminismAudit(const char* recording_path,
+                                 const char* profile_path,
+                                 const PlaybackChannelMask& mask,
+                                 int timed_runs) {
+    LoadedRecording recording;
+    std::string error;
+    if (!LoadRecordingFile(recording_path, &recording, &error)) {
+        std::fprintf(stderr, "--recording-determinism-audit failed loading recording: %s\n",
+                     error.c_str());
+        return 1;
+    }
+
+    TrainerProfile profile;
+    if (!LoadTrainerProfile(profile_path, &profile)) {
+        return 2;
+    }
+    if (recording.metadata.resolution_mode != profile.resolution_mode) {
+        std::fprintf(stderr,
+                     "--recording-determinism-audit resolution mismatch: recording=%s profile=%s\n",
+                     TrainerResolutionModeName(recording.metadata.resolution_mode),
+                     TrainerResolutionModeName(profile.resolution_mode));
+        return 2;
+    }
+    if (recording.metadata.trainer_frame_rate_hz > 0 &&
+        recording.metadata.trainer_frame_rate_hz != profile.frame_rate_hz) {
+        std::printf("warning: recording frame_rate=%d differs from profile frame_rate=%d; "
+                    "timed audit uses the profile frame rate.\n",
+                    recording.metadata.trainer_frame_rate_hz,
+                    profile.frame_rate_hz);
+    }
+    PlaybackChannelMask resolved_mask = mask;
+    if (!ResolveIntegratedPlaybackMaskForProfile(&resolved_mask,
+                                                 profile,
+                                                 recording,
+                                                 recording_path ? recording_path : "",
+                                                 true)) {
+        return 2;
+    }
+
+    const RecordingDeterminismStaticSummary static_summary =
+        SummarizeRecordingDeterminism(recording);
+    const MapperReplayAuditSummary mapper_summary =
+        AuditMapperReplayFromCleanStart(profile, recording, resolved_mask);
+
+    std::printf("\n--recording-determinism-audit: recording=%s\n", recording_path);
+    std::printf("  profile=%s channels=%s timed_runs=%d\n",
+                profile_path,
+                DescribePlaybackChannelMask(resolved_mask).c_str(),
+                timed_runs);
+    std::printf("  recording: samples=%zu unique_mapper_ticks=%zu mapper_tick_gaps=%llu "
+                "right_duplicate_tick_mismatches=%llu "
+                "left_duplicate_tick_mismatches=%llu "
+                "hid_duplicate_tick_variations=%llu\n",
+                static_summary.samples,
+                static_summary.unique_mapper_ticks,
+                static_cast<unsigned long long>(static_summary.mapper_tick_gaps),
+                static_cast<unsigned long long>(
+                    static_summary.right_duplicate_tick_mismatches),
+                static_cast<unsigned long long>(
+                    static_summary.left_duplicate_tick_mismatches),
+                static_cast<unsigned long long>(
+                    static_summary.hid_duplicate_tick_mismatches));
+    std::printf("  recording: rows_per_mapper_tick=%s max_late_us=%lld late_rows_gt_1000us=%llu\n",
+                FormatRowsPerMapperTick(static_summary).c_str(),
+                static_cast<long long>(static_summary.max_late_us),
+                static_cast<unsigned long long>(static_summary.late_rows_gt_1000us));
+    std::printf("  clean-start mapper replay: input_ticks=%zu hash=%s "
+                "right_compare_ticks=%llu right_mismatches=%llu right_max_abs_error=%d "
+                "left_compare_ticks=%llu left_mismatches=%llu left_max_abs_error=%d "
+                "hid_compare_ticks=%llu hid_missing_ticks=%llu\n",
+                mapper_summary.input_ticks,
+                HexUint64(mapper_summary.replay_hash).c_str(),
+                static_cast<unsigned long long>(mapper_summary.right_compare_ticks),
+                static_cast<unsigned long long>(mapper_summary.right_mismatches),
+                mapper_summary.right_max_abs_error,
+                static_cast<unsigned long long>(mapper_summary.left_compare_ticks),
+                static_cast<unsigned long long>(mapper_summary.left_mismatches),
+                mapper_summary.left_max_abs_error,
+                static_cast<unsigned long long>(mapper_summary.hid_compare_ticks),
+                static_cast<unsigned long long>(mapper_summary.hid_missing_ticks));
+    if (mapper_summary.have_first_right_mismatch) {
+        std::printf("  first_right_mismatch: mapper_tick=%u recorded_roll=%d recorded_pitch=%d "
+                    "replayed_roll=%d replayed_pitch=%d\n",
+                    mapper_summary.first_right_mismatch_tick,
+                    mapper_summary.first_expected_roll,
+                    mapper_summary.first_expected_pitch,
+                    mapper_summary.first_replayed_roll,
+                    mapper_summary.first_replayed_pitch);
+    }
+    if (mapper_summary.have_first_left_mismatch) {
+        std::printf("  first_left_mismatch: mapper_tick=%u recorded_throttle=%d recorded_yaw=%d "
+                    "replayed_throttle=%d replayed_yaw=%d\n",
+                    mapper_summary.first_left_mismatch_tick,
+                    mapper_summary.first_expected_throttle,
+                    mapper_summary.first_expected_yaw,
+                    mapper_summary.first_replayed_throttle,
+                    mapper_summary.first_replayed_yaw);
+    }
+
+    if (timed_runs > 0) {
+        std::vector<TimedPlaybackAuditRun> runs;
+        runs.reserve(static_cast<size_t>(timed_runs));
+        bool repeatable = true;
+        for (int run_index = 0; run_index < timed_runs; ++run_index) {
+            const TimedPlaybackAuditRun run =
+                RunTimedIntegratedPlaybackAuditOnce(profile, recording, resolved_mask);
+            if (!runs.empty() &&
+                (run.frame_hash != runs.front().frame_hash ||
+                 run.frames != runs.front().frames ||
+                 run.timed_out != runs.front().timed_out)) {
+                repeatable = false;
+            }
+            const std::string clock_label = run.normalized_overlay_clock
+                ? ("mapper-normalized/" + std::to_string(run.frames_per_mapper_tick))
+                : "sample-rows";
+            std::printf("  timed_run[%d]: frames=%llu input_ticks=%llu mapper_ticks=%llu hash=%s "
+                        "elapsed=%.3fs clock=%s max_late_us=%lld "
+                        "late_frames_gt_1000us=%llu timed_out=%s\n",
+                        run_index + 1,
+                        static_cast<unsigned long long>(run.frames),
+                        static_cast<unsigned long long>(run.input_ticks),
+                        static_cast<unsigned long long>(run.mapper_ticks),
+                        HexUint64(run.frame_hash).c_str(),
+                        run.elapsed_seconds,
+                        clock_label.c_str(),
+                        static_cast<long long>(run.max_late_us),
+                        static_cast<unsigned long long>(run.late_frames_gt_1000us),
+                        run.timed_out ? "yes" : "no");
+            runs.push_back(run);
+        }
+        std::printf("  timed_repeatable=%s\n", repeatable ? "yes" : "no");
+    }
+
+    std::printf("  clean_start_replay_matches_recorded_right=%s\n",
+                mapper_summary.right_mismatches == 0 ? "yes" : "no");
+    std::printf("  clean_start_replay_matches_recorded_left=%s\n",
+                mapper_summary.left_mismatches == 0 ? "yes" : "no");
+    std::printf("  hid_overlay_has_samples=%s\n",
+                mapper_summary.hid_missing_ticks == 0 ? "yes" : "no");
+    return 0;
+}
+
+int RunRecordingSelfTest() {
+    const std::filesystem::path test_path =
+        std::filesystem::path("logs") / "recording-self-test.gx12rec.csv";
+    TrainerProfile profile;
+    profile.name = "recording-self-test";
+    profile.source_file = "recording-self-test";
+    profile.frame_rate_hz = 1000;
+    profile.resolution_mode = TrainerResolutionMode::Gx12_2x;
+    {
+        TrainerProfile return_profile;
+        return_profile.max_output = 512;
+        double roll = 256.0;
+        double pitch = 256.0;
+        ApplyRightStickDiagonalNormalizedReturn(0.0,
+                                                12.0,
+                                                ElasticReturnMode::Linear,
+                                                0.0,
+                                                0.001,
+                                                true,
+                                                &roll,
+                                                &pitch,
+                                                return_profile);
+        const double roll_step = 256.0 - roll;
+        const double pitch_step = 256.0 - pitch;
+        const double vector_step = std::sqrt((roll_step * roll_step) + (pitch_step * pitch_step));
+        if (std::abs(vector_step - 3.072) > 0.001 ||
+            std::abs(roll_step - pitch_step) > 0.001 ||
+            roll_step >= 3.072) {
+            std::fprintf(stderr, "--recording-self-test diagonal elastic return metric failed.\n");
+            return 1;
+        }
+    }
+    {
+        TrainerProfile clutched_profile;
+        clutched_profile.max_output = 512;
+        clutched_profile.roll_gain = 0.0;
+        clutched_profile.pitch_gain = 0.0;
+        clutched_profile.elastic_return_activation = ElasticReturnActivation::WhileMoving;
+        clutched_profile.elastic_return_mode = ElasticReturnMode::Linear;
+        double roll = 256.0;
+        double pitch = 0.0;
+        ElasticAxisState roll_state;
+        ElasticAxisState pitch_state;
+        RightStickSharedState shared_state;
+        int roll_pulse = 0;
+        int pitch_pulse = 0;
+        ShapeRightStickPositionPulses(0.0,
+                                      0.0,
+                                      1.0,
+                                      0.0,
+                                      12.0,
+                                      0.001,
+                                      true,
+                                      &roll,
+                                      &pitch,
+                                      &roll_state,
+                                      &pitch_state,
+                                      &shared_state,
+                                      clutched_profile,
+                                      &roll_pulse,
+                                      &pitch_pulse);
+        if (std::abs(roll - 256.0) > 0.001) {
+            std::fprintf(stderr, "--recording-self-test input-gated elastic return drifted on zero input.\n");
+            return 1;
+        }
+        ShapeRightStickPositionPulses(1.0,
+                                      0.0,
+                                      1.0,
+                                      0.0,
+                                      12.0,
+                                      0.001,
+                                      true,
+                                      &roll,
+                                      &pitch,
+                                      &roll_state,
+                                      &pitch_state,
+                                      &shared_state,
+                                      clutched_profile,
+                                      &roll_pulse,
+                                      &pitch_pulse);
+        if (std::abs(roll - (256.0 - 3.072)) > 0.001) {
+            std::fprintf(stderr, "--recording-self-test input-gated elastic return did not apply while moving.\n");
+            return 1;
+        }
+    }
+    {
+        TrainerProfile tapered_profile;
+        tapered_profile.elastic_return_activation = ElasticReturnActivation::WhileMoving;
+        tapered_profile.elastic_return_idle_coefficient = 3.0;
+        tapered_profile.elastic_return_taper_ms = 100.0;
+        RightStickSharedState tapered_state;
+        const double moving_coeff =
+            EffectiveElasticReturnCoefficient(tapered_profile, 12.0, true, 0.001, &tapered_state);
+        const double mid_coeff =
+            EffectiveElasticReturnCoefficient(tapered_profile, 12.0, false, 0.050, &tapered_state);
+        const double idle_coeff =
+            EffectiveElasticReturnCoefficient(tapered_profile, 12.0, false, 0.050, &tapered_state);
+        if (std::abs(moving_coeff - 12.0) > 0.001 ||
+            std::abs(mid_coeff - 7.5) > 0.001 ||
+            std::abs(idle_coeff - 3.0) > 0.001) {
+            std::fprintf(stderr, "--recording-self-test tapered elastic return coefficient failed.\n");
+            return 1;
+        }
+    }
+
+    Gx12RecordingHidCapture fake_hid;
+    fake_hid.available = true;
+    fake_hid.last_valid = true;
+    fake_hid.reports = 1;
+    fake_hid.last_report.channels[0] = 11;
+    fake_hid.last_report.channels[1] = -22;
+    fake_hid.last_report.channels[2] = 333;
+    fake_hid.last_report.channels[3] = -444;
+
+    RecordingCsvWriter writer;
+    if (!writer.Open(profile, test_path.string().c_str(), 1000, fake_hid)) {
+        return 1;
+    }
+    ElasticAxisState self_test_roll_elastic;
+    ElasticAxisState self_test_pitch_elastic;
+    self_test_roll_elastic.velocity = 1.25;
+    self_test_pitch_elastic.velocity = -2.5;
+    RecordingStartState self_test_start =
+        MakeRecordingStartStateFromRightStick(7.0,
+                                              -9.0,
+                                              self_test_roll_elastic,
+                                              self_test_pitch_elastic,
+                                              14,
+                                              -18);
+    self_test_start.mouse_left_available = true;
+    self_test_start.mouse_left_throttle_value = -321.0;
+    self_test_start.mouse_left_yaw_value = 12.0;
+    self_test_start.mouse_left_yaw_filtered = 10.0;
+    self_test_start.mouse_left_yaw_position = 12.0;
+    self_test_start.mouse_left_yaw_dummy_position = 0.0;
+    self_test_start.mouse_left_yaw_velocity = 1.5;
+    self_test_start.mouse_left_yaw_dummy_velocity = -0.25;
+    self_test_start.mouse_left_throttle_pulse =
+        QuantizeTrainerProfileOutput(-321.0, profile.resolution_mode);
+    self_test_start.mouse_left_yaw_pulse =
+        QuantizeTrainerProfileOutput(10.0, profile.resolution_mode);
+    writer.WriteStartState(self_test_start);
+    std::array<int, kSbusChannels> final_channels{};
+    final_channels[0] = 20;
+    final_channels[1] = -40;
+    final_channels[2] = QuantizeTrainerProfileOutput(-313.0, profile.resolution_mode);
+    final_channels[3] = QuantizeTrainerProfileOutput(19.0, profile.resolution_mode);
+    writer.WriteSample(0, 1, 1, 10, 10, 0, 3, -4, 0, 0, 0, 7, -8, 0, 0, 0,
+                       final_channels, fake_hid, kSbusTrainerMaskMarker, 0);
+    fake_hid.last_report.channels[2] = 555;
+    fake_hid.last_report.channels[3] = -666;
+    fake_hid.reports = 2;
+    final_channels[0] = 30;
+    final_channels[1] = -60;
+    final_channels[2] = QuantizeTrainerProfileOutput(-303.0, profile.resolution_mode);
+    final_channels[3] = QuantizeTrainerProfileOutput(28.0, profile.resolution_mode);
+    writer.WriteSample(1000, 2, 2, 11, 11, 0, 5, -6, 0, 120, 0, 9, -10, 0, 0, 0,
+                       final_channels, fake_hid, kSbusTrainerMaskMarker, 0);
+    writer.Close();
+
+    const std::filesystem::path async_test_path =
+        std::filesystem::path("logs") / "recording-async-commit-self-test.gx12rec.csv";
+    RecordingCsvWriter async_writer;
+    if (!async_writer.Open(profile, async_test_path.string().c_str(), 1000, fake_hid)) {
+        std::fprintf(stderr, "--recording-self-test async writer open failed.\n");
+        return 1;
+    }
+    async_writer.WriteStartState(self_test_start);
+    async_writer.WriteSample(0, 1, 1, 12, 12, 0, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0,
+                             final_channels, fake_hid, kSbusTrainerMaskMarker, 0);
+    RecordingCsvWriter::CommitSnapshot async_snapshot =
+        async_writer.CloseToSnapshot();
+    RecordingCommitQueue async_commits;
+    async_commits.Start();
+    async_commits.Enqueue(std::move(async_snapshot));
+    async_commits.Stop();
+    const std::vector<RecordingCsvWriter::CommitResult> async_results =
+        async_commits.DrainCompleted();
+    if (async_results.size() != 1 ||
+        !async_results.front().ok ||
+        !async_results.front().attempted ||
+        async_results.front().sample_rows != 1) {
+        std::fprintf(stderr, "--recording-self-test async commit failed.\n");
+        return 1;
+    }
+    LoadedRecording async_loaded;
+    std::string async_error;
+    if (!LoadRecordingFile(async_test_path.string().c_str(), &async_loaded, &async_error) ||
+        async_loaded.samples.size() != 1) {
+        std::fprintf(stderr,
+                     "--recording-self-test async parse failed: %s\n",
+                     async_error.c_str());
+        return 1;
+    }
+
+    const std::filesystem::path profile_log_path =
+        std::filesystem::path("logs") / "trainer-csv-self-test.csv";
+    TrainerProfile profile_log_settings = profile;
+    profile_log_settings.log_csv = true;
+    profile_log_settings.log_path = profile_log_path.string();
+    TrainerCsvLogWriter profile_log;
+    if (!profile_log.Open(profile_log_settings)) {
+        std::fprintf(stderr, "--recording-self-test trainer CSV log open failed.\n");
+        return 1;
+    }
+    TrainerCsvLogWriter::Row profile_log_row;
+    profile_log_row.frame = 42;
+    profile_log_row.mouse_events = 99;
+    profile_log_row.roll = 123;
+    profile_log_row.pitch = -45;
+    profile_log_row.throttle = TrainerLowValue(profile.resolution_mode);
+    profile_log_row.yaw = 6;
+    profile_log.Enqueue(profile_log_row);
+    profile_log.Close();
+    {
+        std::ifstream profile_log_file(profile_log_path);
+        std::ostringstream profile_log_text;
+        profile_log_text << profile_log_file.rdbuf();
+        const std::string text = profile_log_text.str();
+        if (text.find("time_s,frame,mouse_events") == std::string::npos ||
+            text.find("\n0,42,99,") == std::string::npos) {
+            std::fprintf(stderr, "--recording-self-test trainer CSV log writer failed.\n");
+            return 1;
+        }
+    }
+
+    LoadedRecording loaded;
+    std::string error;
+    if (!LoadRecordingFile(test_path.string().c_str(), &loaded, &error)) {
+        std::fprintf(stderr, "--recording-self-test parse failed: %s\n", error.c_str());
+        return 1;
+    }
+    if (loaded.samples.size() != 2 || !loaded.has_hid_samples ||
+        loaded.metadata.resolution_mode != TrainerResolutionMode::Gx12_2x ||
+        loaded.metadata.recording_buffer != "memory" ||
+        !loaded.metadata.start_state.right_mapper_available ||
+        loaded.metadata.start_state.right_roll_value != 7.0 ||
+        loaded.metadata.start_state.right_pitch_value != -9.0 ||
+        loaded.metadata.start_state.right_roll_pulse != 14 ||
+        loaded.metadata.start_state.right_pitch_pulse != -18 ||
+        !loaded.metadata.start_state.mouse_left_available ||
+        loaded.metadata.start_state.mouse_left_throttle_value != -321.0 ||
+        loaded.metadata.start_state.mouse_left_yaw_value != 12.0) {
+        std::fprintf(stderr, "--recording-self-test metadata/sample validation failed.\n");
+        return 1;
+    }
+    if (loaded.samples[0].right_dx != 3 || loaded.samples[0].right_dy != -4 ||
+        loaded.samples[1].right_dx != 5 || loaded.samples[1].right_dy != -6) {
+        std::fprintf(stderr, "--recording-self-test raw mouse input parse failed.\n");
+        return 1;
+    }
+
+    PlaybackChannelMask right_mask;
+    if (!ParsePlaybackChannelMask("ail+ele", &right_mask)) {
+        std::fprintf(stderr, "--recording-self-test channel parser failed for ail+ele.\n");
+        return 1;
+    }
+    PlaybackBankSlot input_slot;
+    input_slot.spec.mask = right_mask;
+    input_slot.spec.block_live_input = true;
+    input_slot.recording = loaded;
+    profile.mouse_right_stick_enabled = true;
+    int64_t live_right_dx = 99;
+    int64_t live_right_dy = -88;
+    int64_t live_right_wheel_y = 77;
+    uint32_t live_right_buttons = 0x30;
+    int64_t live_left_dx = 66;
+    int64_t live_left_dy = -55;
+    ClearPlaybackLiveInputForMask(input_slot.spec,
+                                  profile,
+                                  &live_right_dx,
+                                  &live_right_dy,
+                                  &live_right_wheel_y,
+                                  &live_right_buttons,
+                                  &live_left_dx,
+                                  &live_left_dy);
+    if (live_right_dx != 0 || live_right_dy != 0 ||
+        live_right_wheel_y != 77 || live_right_buttons != 0x30 ||
+        live_left_dx != 66 || live_left_dy != -55) {
+        std::fprintf(stderr, "--recording-self-test live input block helper failed.\n");
+        return 1;
+    }
+    size_t input_sample_index = 0;
+    bool have_mapper_tick = false;
+    uint32_t last_mapper_tick = 0;
+    const auto first_injection =
+        ConsumePlaybackInputInjection(input_slot,
+                                      profile,
+                                      0,
+                                      loaded.samples.front().time_us,
+                                      &input_sample_index,
+                                      &have_mapper_tick,
+                                      &last_mapper_tick);
+    if (first_injection.right_dx != 3 || first_injection.right_dy != -4 ||
+        first_injection.mapper_ticks != 1) {
+        std::fprintf(stderr, "--recording-self-test input injection first tick failed.\n");
+        return 1;
+    }
+    const auto second_injection =
+        ConsumePlaybackInputInjection(input_slot,
+                                      profile,
+                                      1000,
+                                      loaded.samples.front().time_us,
+                                      &input_sample_index,
+                                      &have_mapper_tick,
+                                      &last_mapper_tick);
+    if (second_injection.right_dx != 5 || second_injection.right_dy != -6 ||
+        second_injection.mapper_ticks != 1) {
+        std::fprintf(stderr, "--recording-self-test input injection second tick failed.\n");
+        return 1;
+    }
+
+    PlaybackChannelMask mouse_left_input_mask;
+    if (!ParsePlaybackChannelMask("mouse_left", &mouse_left_input_mask) ||
+        DescribePlaybackChannelMask(mouse_left_input_mask) != "thr,rud") {
+        std::fprintf(stderr, "--recording-self-test channel parser failed for mouse_left.\n");
+        return 1;
+    }
+    PlaybackBankSlot mouse_left_input_slot;
+    mouse_left_input_slot.spec.mask = mouse_left_input_mask;
+    mouse_left_input_slot.spec.block_live_input = true;
+    mouse_left_input_slot.recording = loaded;
+    TrainerProfile mouse_left_profile = profile;
+    mouse_left_profile.mouse_right_stick_enabled = false;
+    mouse_left_profile.mouse_left.enabled = true;
+    mouse_left_profile.mouse_left.throttle_rate = 1.0;
+    mouse_left_profile.mouse_left.yaw_gain = 1.0;
+    mouse_left_profile.mouse_left.yaw_shaping_enabled = false;
+    mouse_left_profile.mouse_left.yaw_slew_rate = 0.0;
+    mouse_left_profile.mouse_left.yaw_deadband = 0;
+    size_t left_input_sample_index = 0;
+    bool left_have_mapper_tick = false;
+    uint32_t left_last_mapper_tick = 0;
+    const auto left_first_injection =
+        ConsumePlaybackInputInjection(mouse_left_input_slot,
+                                      mouse_left_profile,
+                                      0,
+                                      loaded.samples.front().time_us,
+                                      &left_input_sample_index,
+                                      &left_have_mapper_tick,
+                                      &left_last_mapper_tick);
+    if (left_first_injection.left_dx != 7 ||
+        left_first_injection.left_dy != -8 ||
+        left_first_injection.mapper_ticks != 1) {
+        std::fprintf(stderr, "--recording-self-test left input injection failed.\n");
+        return 1;
+    }
+    LeftStickPlaybackState left_playback_state =
+        MakeLeftStickPlaybackStateFromRecording(mouse_left_profile,
+                                                loaded.metadata.start_state);
+    StepLeftStickPlaybackState(mouse_left_profile,
+                               left_first_injection,
+                               1000,
+                               &left_playback_state);
+    const int expected_left_throttle = QuantizeTrainerProfileOutput(
+        -313.0,
+        mouse_left_profile.resolution_mode);
+    const int expected_left_yaw = QuantizeTrainerProfileOutput(
+        19.0,
+        mouse_left_profile.resolution_mode);
+    if (left_playback_state.throttle_pulse != expected_left_throttle ||
+        left_playback_state.yaw_pulse != expected_left_yaw) {
+        std::fprintf(stderr, "--recording-self-test left playback state failed.\n");
+        return 1;
+    }
+    const auto right_pulses =
+        BuildPlaybackPulses(loaded.samples[0], right_mask, loaded.metadata.resolution_mode);
+    if (right_pulses[0] != 20 || right_pulses[1] != -40 ||
+        right_pulses[2] != TrainerLowValue(TrainerResolutionMode::Gx12_2x)) {
+        std::fprintf(stderr, "--recording-self-test right-channel pulse validation failed.\n");
+        return 1;
+    }
+    if (!PlaybackChannelUsesInputInjection(right_mask, profile, 0) ||
+        !PlaybackChannelUsesInputInjection(right_mask, profile, 1)) {
+        std::fprintf(stderr, "--recording-self-test right input mask validation failed.\n");
+        return 1;
+    }
+
+    PlaybackChannelMask trainer_right_mask;
+    if (!ParsePlaybackChannelMask("trainer_right", &trainer_right_mask) ||
+        DescribePlaybackChannelMask(trainer_right_mask) != "trainer_ail,trainer_ele" ||
+        PlaybackChannelUsesInputInjection(trainer_right_mask, profile, 0) ||
+        PlaybackChannelUsesInputInjection(trainer_right_mask, profile, 1)) {
+        std::fprintf(stderr, "--recording-self-test channel parser failed for trainer_right.\n");
+        return 1;
+    }
+    const PlaybackChannelMask default_mask = DefaultPlaybackChannelMask();
+    if (DescribePlaybackChannelMask(default_mask) != "trainer_ail,trainer_ele" ||
+        PlaybackChannelUsesInputInjection(default_mask, profile, 0) ||
+        PlaybackChannelUsesInputInjection(default_mask, profile, 1)) {
+        std::fprintf(stderr, "--recording-self-test default playback mask validation failed.\n");
+        return 1;
+    }
+    const std::vector<size_t> mapper_tick_indices =
+        BuildPlaybackMapperTickSampleIndices(loaded);
+    TrainerProfile high_rate_profile = profile;
+    high_rate_profile.frame_rate_hz = 2000;
+    if (mapper_tick_indices.size() != 2 ||
+        mapper_tick_indices[0] != 0 ||
+        mapper_tick_indices[1] != 1 ||
+        !PlaybackMaskUsesOnlyRecordedOverlay(default_mask) ||
+        PlaybackMaskUsesOnlyRecordedOverlay(right_mask) ||
+        PlaybackFramesPerRecordedMapperTick(high_rate_profile, loaded) != 2) {
+        std::fprintf(stderr,
+                     "--recording-self-test normalized overlay clock validation failed.\n");
+        return 1;
+    }
+
+    PlaybackChannelMask radio_right_mask;
+    if (!ParsePlaybackChannelMask("radio_right", &radio_right_mask)) {
+        std::fprintf(stderr, "--recording-self-test channel parser failed for radio_right.\n");
+        return 1;
+    }
+    const auto radio_right_pulses =
+        BuildPlaybackPulses(loaded.samples[0], radio_right_mask, loaded.metadata.resolution_mode);
+    if (radio_right_pulses[0] != 11 || radio_right_pulses[1] != -22 ||
+        radio_right_pulses[2] != TrainerLowValue(TrainerResolutionMode::Gx12_2x) ||
+        !radio_right_mask.UsesHidRightStick()) {
+        std::fprintf(stderr, "--recording-self-test radio-right-gimbal pulse validation failed.\n");
+        return 1;
+    }
+
+    PlaybackChannelMask left_mask;
+    if (!ParsePlaybackChannelMask("thr+rud", &left_mask) ||
+        DescribePlaybackChannelMask(left_mask) != "thr,rud") {
+        std::fprintf(stderr, "--recording-self-test channel parser failed for thr+rud.\n");
+        return 1;
+    }
+    if (!PlaybackChannelUsesInputInjection(left_mask, mouse_left_profile, 2) ||
+        !PlaybackChannelUsesInputInjection(left_mask, mouse_left_profile, 3) ||
+        PlaybackMaskUsesOnlyRecordedOverlay(left_mask)) {
+        std::fprintf(stderr, "--recording-self-test left input mask validation failed.\n");
+        return 1;
+    }
+
+    PlaybackChannelMask trainer_left_mask;
+    if (!ParsePlaybackChannelMask("trainer_thr,trainer_rud", &trainer_left_mask) ||
+        DescribePlaybackChannelMask(trainer_left_mask) != "trainer_thr,trainer_rud") {
+        std::fprintf(stderr, "--recording-self-test channel parser failed for trainer left.\n");
+        return 1;
+    }
+    const auto trainer_left_pulses =
+        BuildPlaybackPulses(loaded.samples[1], trainer_left_mask, loaded.metadata.resolution_mode);
+    if (trainer_left_pulses[2] != QuantizeTrainerProfileOutput(-303.0, profile.resolution_mode) ||
+        trainer_left_pulses[3] != QuantizeTrainerProfileOutput(28.0, profile.resolution_mode) ||
+        PlaybackChannelUsesInputInjection(trainer_left_mask, profile, 2) ||
+        PlaybackChannelUsesInputInjection(trainer_left_mask, profile, 3)) {
+        std::fprintf(stderr, "--recording-self-test trainer-left pulse validation failed.\n");
+        return 1;
+    }
+
+    PlaybackChannelMask radio_left_mask;
+    if (!ParsePlaybackChannelMask("radio_thr,radio_rud", &radio_left_mask) ||
+        DescribePlaybackChannelMask(radio_left_mask) != "radio_thr,radio_rud") {
+        std::fprintf(stderr, "--recording-self-test channel parser failed for radio left.\n");
+        return 1;
+    }
+    const auto radio_left_pulses =
+        BuildPlaybackPulses(loaded.samples[1], radio_left_mask, loaded.metadata.resolution_mode);
+    if (radio_left_pulses[2] != 555 || radio_left_pulses[3] != -666 ||
+        PlaybackChannelUsesInputInjection(radio_left_mask, profile, 2) ||
+        PlaybackChannelUsesInputInjection(radio_left_mask, profile, 3)) {
+        std::fprintf(stderr, "--recording-self-test radio-left pulse validation failed.\n");
+        return 1;
+    }
+
+    TrainerProfile no_left_source_profile = profile;
+    no_left_source_profile.mouse_left.enabled = false;
+    no_left_source_profile.right_mouse_left.enabled = false;
+    PlaybackChannelMask unavailable_left_input_mask;
+    if (!ParsePlaybackChannelMask("thr,rud", &unavailable_left_input_mask) ||
+        !ResolveIntegratedPlaybackMaskForProfile(&unavailable_left_input_mask,
+                                                 no_left_source_profile,
+                                                 loaded,
+                                                 "self-test",
+                                                 false) ||
+        DescribePlaybackChannelMask(unavailable_left_input_mask) !=
+            "radio_thr,radio_rud") {
+        std::fprintf(stderr,
+                     "--recording-self-test unavailable left input HID fallback failed.\n");
+        return 1;
+    }
+    LoadedRecording no_hid_loaded = loaded;
+    no_hid_loaded.has_hid_samples = false;
+    PlaybackChannelMask unavailable_left_no_hid_mask;
+    if (!ParsePlaybackChannelMask("thr,rud", &unavailable_left_no_hid_mask) ||
+        ResolveIntegratedPlaybackMaskForProfile(&unavailable_left_no_hid_mask,
+                                                no_left_source_profile,
+                                                no_hid_loaded,
+                                                "self-test",
+                                                false)) {
+        std::fprintf(stderr,
+                     "--recording-self-test unavailable left input no-HID failure check failed.\n");
+        return 1;
+    }
+
+    PlaybackChannelMask gimbals_mask;
+    if (!ParsePlaybackChannelMask("gimbals", &gimbals_mask)) {
+        std::fprintf(stderr, "--recording-self-test channel parser failed for gimbals.\n");
+        return 1;
+    }
+    const auto gimbals_pulses =
+        BuildPlaybackPulses(loaded.samples[1], gimbals_mask, loaded.metadata.resolution_mode);
+    if (gimbals_pulses[0] != 11 || gimbals_pulses[1] != -22 ||
+        gimbals_pulses[2] != 555 || gimbals_pulses[3] != -666 ||
+        DescribePlaybackChannelMask(gimbals_mask) != "radio_ail,radio_ele,radio_thr,radio_rud") {
+        std::fprintf(stderr, "--recording-self-test all-gimbal pulse validation failed.\n");
+        return 1;
+    }
+
+    PlaybackTrigger trigger;
+    if (!ParsePlaybackTrigger("Mouse4", &trigger) || trigger.virtual_key != VK_XBUTTON1) {
+        std::fprintf(stderr, "--recording-self-test trigger parser failed.\n");
+        return 1;
+    }
+    if (ParseTriggerVirtualKeyName("Mouse5") != VK_XBUTTON2) {
+        std::fprintf(stderr, "--recording-self-test record-toggle mouse parser failed.\n");
+        return 1;
+    }
+
+    const std::filesystem::path control_path =
+        std::filesystem::path("logs") / "runtime-control-self-test.tsv";
+    {
+        std::ofstream control(control_path);
+        control << "# gx12_runtime_control=1\n"
+                << "recording_path\tlogs\\live.gx12rec.csv\n"
+                << "record_duration\t30\n"
+                << "record_toggle\tF4\n"
+                << "record_overwrite\t1\n"
+                << "playback_loop\t0\n"
+                << "bind\tF5\tail,ele\tlogs\\live.gx12rec.csv\t1\n";
+    }
+    TrainerRuntimeControlSnapshot control_snapshot;
+    std::string control_error;
+    if (!LoadTrainerRuntimeControlFile(control_path.string(), &control_snapshot, &control_error) ||
+        control_snapshot.recording.path != "logs\\live.gx12rec.csv" ||
+        control_snapshot.recording.max_seconds != 30 ||
+        control_snapshot.recording.toggle_key_vk != VK_F4 ||
+        !control_snapshot.recording.overwrite_existing ||
+        control_snapshot.playback_bank.loop ||
+        control_snapshot.playback_bank.specs.size() != 1 ||
+        control_snapshot.playback_bank.specs[0].trigger.virtual_key != VK_F5 ||
+        !control_snapshot.playback_bank.specs[0].mask.UsesRightStick() ||
+        !control_snapshot.playback_bank.specs[0].block_live_input) {
+        std::fprintf(stderr,
+                     "--recording-self-test runtime control parser failed: %s\n",
+                     control_error.c_str());
+        return 1;
+    }
+
+    RecordingPlaybackAuditResult audit_result;
+    std::string audit_error;
+    if (!RunSyntheticRecordingPlaybackAudit(&audit_result, &audit_error)) {
+        std::fprintf(stderr,
+                     "--recording-self-test synthetic playback audit failed: %s\n",
+                     audit_error.c_str());
+        return 1;
+    }
+    if (audit_result.current_max_abs_error != 0 ||
+        audit_result.legacy_timestamp_max_abs_error <= 0 ||
+        audit_result.legacy_timestamp_empty_ticks == 0) {
+        std::fprintf(stderr,
+                     "--recording-self-test synthetic playback audit deviation check failed: "
+                     "current_max=%d legacy_timestamp_max=%d legacy_empty_ticks=%u\n",
+                     audit_result.current_max_abs_error,
+                     audit_result.legacy_timestamp_max_abs_error,
+                     audit_result.legacy_timestamp_empty_ticks);
+        return 1;
+    }
+    std::printf("--recording-self-test synthetic playback audit: samples=%zu mapper_ticks=%u "
+                "current_max_dev=%d legacy_timestamp_max_dev=%d legacy_empty_ticks=%u\n",
+                audit_result.samples,
+                audit_result.mapper_ticks,
+                audit_result.current_max_abs_error,
+                audit_result.legacy_timestamp_max_abs_error,
+                audit_result.legacy_timestamp_empty_ticks);
+
+    std::printf("\n--recording-self-test PASS path=%s samples=%zu\n",
+                test_path.string().c_str(),
+                loaded.samples.size());
     return 0;
 }
 
@@ -7750,42 +14259,6 @@ int RunMouseLeftDryRun(const TrainerProfile& profile, int seconds) {
 
 // ---- GX12 HID diagnostics --------------------------------------------------
 
-constexpr unsigned short kGx12VendorId  = 0x1209;
-constexpr unsigned short kGx12ProductId = 0x4F54;
-constexpr int kGx12HidReportSize     = 20;
-constexpr int kGx12ChannelCount      = 8;
-constexpr int kGx12ChannelCenter     = 1024;
-
-struct Gx12DecodedReport {
-    uint32_t buttons = 0;  // 24 bits in lower 24
-    int16_t channels[kGx12ChannelCount] = {};
-};
-
-bool DecodeGx12Report(const unsigned char* data, int length, Gx12DecodedReport* out) {
-    if (!data || length < kGx12HidReportSize) {
-        return false;
-    }
-    out->buttons = static_cast<uint32_t>(data[0]) |
-                   (static_cast<uint32_t>(data[1]) << 8) |
-                   (static_cast<uint32_t>(data[2]) << 16);
-    for (int ch = 0; ch < kGx12ChannelCount; ++ch) {
-        const int byte_index = 3 + ch * 2;
-        const uint16_t raw = static_cast<uint16_t>(data[byte_index]) |
-                             (static_cast<uint16_t>(data[byte_index + 1]) << 8);
-        out->channels[ch] = static_cast<int16_t>(static_cast<int>(raw) - kGx12ChannelCenter);
-    }
-    return true;
-}
-
-const HidDeviceEntry* FindGx12Hid(const std::vector<HidDeviceEntry>& devices) {
-    for (const HidDeviceEntry& device : devices) {
-        if (device.vendor_id == kGx12VendorId && device.product_id == kGx12ProductId) {
-            return &device;
-        }
-    }
-    return nullptr;
-}
-
 struct Gx12HidChannelGranularity {
     uint64_t samples = 0;
     int min_raw = 0;
@@ -7863,7 +14336,7 @@ int RunGx12HidCapture(int seconds, const char* csv_path) {
             hid_exit();
             return 1;
         }
-        csv << "elapsed_ms,report,buttons";
+        csv << "elapsed_ms,elapsed_us,dt_us,report,buttons";
         for (int ch = 0; ch < kGx12ChannelCount; ++ch) {
             csv << ",ch" << (ch + 1) << "_raw";
         }
@@ -7904,25 +14377,33 @@ int RunGx12HidCapture(int seconds, const char* csv_path) {
     const auto start = clock::now();
     const auto end = start + std::chrono::seconds(seconds);
     auto next_print = start + std::chrono::milliseconds(250);
+    auto last_print_time = start;
     std::array<unsigned char, 64> buffer{};
     std::array<Gx12HidChannelGranularity, kGx12ChannelCount> channels{};
+    HidReportTiming timing;
     uint64_t reports = 0;
+    uint64_t last_print_reports = 0;
     uint64_t timeouts = 0;
     uint64_t errors = 0;
     std::string last_error;
 
     while (clock::now() < end) {
         const int read = hid_read_timeout(device, buffer.data(), buffer.size(), 1);
+        const auto now = clock::now();
         if (read > 0) {
             Gx12DecodedReport decoded{};
             if (DecodeGx12Report(buffer.data(), read, &decoded)) {
                 ++reports;
-                const auto now = clock::now();
                 const double elapsed_ms =
                     std::chrono::duration<double, std::milli>(now - start).count();
+                const auto elapsed_us =
+                    std::chrono::duration_cast<std::chrono::microseconds>(now - start)
+                        .count();
+                const uint64_t dt_us = timing.Record(now);
 
                 if (csv) {
-                    csv << elapsed_ms << "," << reports << "," << decoded.buttons;
+                    csv << elapsed_ms << "," << elapsed_us << "," << dt_us << ","
+                        << reports << "," << decoded.buttons;
                 }
                 for (int ch = 0; ch < kGx12ChannelCount; ++ch) {
                     channels[ch].Record(decoded.channels[ch]);
@@ -7942,12 +14423,18 @@ int RunGx12HidCapture(int seconds, const char* csv_path) {
             break;
         }
 
-        const auto now = clock::now();
         if (now >= next_print) {
             const double elapsed = std::chrono::duration<double>(now - start).count();
-            std::printf("[%.3fs] reports=%6llu ch1=%4d ch2=%4d ch3=%4d ch4=%4d timeout=%llu err=%llu\n",
+            const double window_seconds =
+                std::chrono::duration<double>(now - last_print_time).count();
+            const uint64_t window_reports = reports - last_print_reports;
+            const double window_hz = window_seconds > 0.0
+                                         ? static_cast<double>(window_reports) / window_seconds
+                                         : 0.0;
+            std::printf("[%.3fs] reports=%6llu rate=%7.1f Hz ch1=%4d ch2=%4d ch3=%4d ch4=%4d timeout=%llu err=%llu\n",
                         elapsed,
                         static_cast<unsigned long long>(reports),
+                        window_hz,
                         channels[0].last_raw,
                         channels[1].last_raw,
                         channels[2].last_raw,
@@ -7955,6 +14442,8 @@ int RunGx12HidCapture(int seconds, const char* csv_path) {
                         static_cast<unsigned long long>(timeouts),
                         static_cast<unsigned long long>(errors));
             std::fflush(stdout);
+            last_print_reports = reports;
+            last_print_time = now;
             next_print += std::chrono::milliseconds(250);
         }
     }
@@ -7978,6 +14467,13 @@ int RunGx12HidCapture(int seconds, const char* csv_path) {
     }
     if (!last_error.empty()) {
         std::printf("last read error: %s\n", last_error.c_str());
+    }
+    if (timing.intervals > 0) {
+        std::printf("report_interval: avg=%.3f ms min=%.3f ms max=%.3f ms samples=%llu\n",
+                    timing.AverageIntervalUs() / 1000.0,
+                    static_cast<double>(timing.min_interval_us) / 1000.0,
+                    static_cast<double>(timing.max_interval_us) / 1000.0,
+                    static_cast<unsigned long long>(timing.intervals));
     }
 
     hid_close(device);
@@ -8595,6 +15091,412 @@ int main(int argc, char** argv) {
         return RunTrainerResolutionSelfTest();
     }
 
+    if (std::strcmp(argv[1], "--trainer-record") == 0) {
+        if (argc < 4) {
+            std::fprintf(stderr, "--trainer-record requires a profile file and output recording, for example profiles\\whoop-linear.toml logs\\run.gx12rec.csv.\n");
+            return 2;
+        }
+
+        TrainerProfile profile;
+        if (!LoadTrainerProfile(argv[2], &profile)) {
+            return 2;
+        }
+        bool live_reload = false;
+        bool saw_duration = false;
+        int recording_duration_seconds = 0;
+        TrainerRecordingOptions recording_options;
+        TrainerRuntimeControlOptions runtime_control_options;
+        recording_options.path = argv[3];
+        recording_options.start_immediately = true;
+        auto set_record_toggle_key = [&](const std::string& text) {
+            const int vk = ParseTriggerVirtualKeyName(text);
+            if (vk <= 0) {
+                return false;
+            }
+            recording_options.toggle_key_vk = vk;
+            recording_options.toggle_key_label = TrimAscii(text);
+            return true;
+        };
+        for (int i = 4; i < argc; ++i) {
+            const std::string arg = argv[i];
+            const std::string lowered = ToLowerAscii(arg);
+            if (lowered == "live" || lowered == "--live") {
+                live_reload = true;
+                continue;
+            }
+            if (lowered == "--record-overwrite" ||
+                lowered == "--recording-overwrite" ||
+                lowered == "--overwrite-recording") {
+                recording_options.overwrite_existing = true;
+                continue;
+            }
+            if (lowered.rfind("--runtime-control=", 0) == 0 ||
+                lowered.rfind("--control=", 0) == 0) {
+                const size_t equals = arg.find('=');
+                runtime_control_options.path = equals == std::string::npos ? "" : arg.substr(equals + 1);
+                continue;
+            }
+            if (lowered == "--runtime-control" || lowered == "--control") {
+                if (i + 1 >= argc) {
+                    std::fprintf(stderr, "%s needs a runtime control file path.\n", arg.c_str());
+                    return 2;
+                }
+                runtime_control_options.path = argv[++i];
+                continue;
+            }
+            if (lowered.rfind("--record-toggle=", 0) == 0 ||
+                lowered.rfind("--recording-toggle=", 0) == 0 ||
+                lowered.rfind("--record-key=", 0) == 0 ||
+                lowered.rfind("--recording-key=", 0) == 0) {
+                const size_t equals = arg.find('=');
+                const std::string value = equals == std::string::npos ? "" : arg.substr(equals + 1);
+                if (!set_record_toggle_key(value)) {
+                    std::fprintf(stderr, "invalid --trainer-record toggle key/button: %s\n", arg.c_str());
+                    return 2;
+                }
+                continue;
+            }
+            if (lowered == "--record-toggle" ||
+                lowered == "--recording-toggle" ||
+                lowered == "--record-key" ||
+                lowered == "--recording-key") {
+                if (i + 1 >= argc) {
+                    std::fprintf(stderr, "%s needs a key or mouse button name such as F4, Space, or Mouse4.\n", arg.c_str());
+                    return 2;
+                }
+                if (!set_record_toggle_key(argv[++i])) {
+                    std::fprintf(stderr, "invalid --trainer-record toggle key/button: %s\n", argv[i]);
+                    return 2;
+                }
+                continue;
+            }
+            if (saw_duration) {
+                std::fprintf(stderr, "duplicate --trainer-record duration override: %s\n", arg.c_str());
+                return 2;
+            }
+            profile.seconds = ParsePositiveIntLimit(arg.c_str(),
+                                                    profile.seconds,
+                                                    kTrainerProfileMaxSeconds);
+            if (profile.seconds <= 0) {
+                std::fprintf(stderr, "invalid --trainer-record duration override: %s\n", arg.c_str());
+                return 2;
+            }
+            recording_duration_seconds = profile.seconds;
+            saw_duration = true;
+            if (!ValidateTrainerProfile(profile)) {
+                return 2;
+            }
+        }
+        if (recording_options.ToggleMode()) {
+            recording_options.start_immediately = false;
+            recording_options.max_seconds = saw_duration ? recording_duration_seconds : 0;
+            profile.seconds = kTrainerProfileIndefiniteSeconds;
+        }
+        return RunTrainerProfile(profile, false, live_reload, recording_options, TrainerPlaybackBankOptions{}, runtime_control_options);
+    }
+
+    if (std::strcmp(argv[1], "--trainer-playback") == 0) {
+        if (argc < 3) {
+            std::fprintf(stderr, "--trainer-playback requires a recording file.\n");
+            return 2;
+        }
+
+        std::string port = "auto";
+        bool port_explicit = false;
+        bool loop = false;
+        PlaybackChannelMask mask;
+        bool channel_mask_specified = false;
+        PlaybackTrigger trigger;
+        for (int i = 3; i < argc; ++i) {
+            std::string arg = argv[i];
+            const std::string lowered = ToLowerAscii(arg);
+            if (lowered == "once" || lowered == "--once") {
+                loop = false;
+                continue;
+            }
+            if (lowered == "loop" || lowered == "--loop") {
+                loop = true;
+                continue;
+            }
+            if (lowered.rfind("--port=", 0) == 0) {
+                port = arg.substr(7);
+                port_explicit = true;
+                continue;
+            }
+            if (lowered == "--port") {
+                if (i + 1 >= argc) {
+                    std::fprintf(stderr, "--trainer-playback --port needs COM3 or auto.\n");
+                    return 2;
+                }
+                port = argv[++i];
+                port_explicit = true;
+                continue;
+            }
+            if (lowered.rfind("--channels=", 0) == 0) {
+                if (!channel_mask_specified) {
+                    ClearPlaybackChannelMask(&mask);
+                    channel_mask_specified = true;
+                }
+                if (!ParsePlaybackChannelMask(arg.substr(11), &mask)) {
+                    std::fprintf(stderr, "invalid --trainer-playback channel mask: %s\n", arg.c_str());
+                    return 2;
+                }
+                continue;
+            }
+            if (lowered.rfind("channels=", 0) == 0) {
+                if (!channel_mask_specified) {
+                    ClearPlaybackChannelMask(&mask);
+                    channel_mask_specified = true;
+                }
+                if (!ParsePlaybackChannelMask(arg.substr(9), &mask)) {
+                    std::fprintf(stderr, "invalid --trainer-playback channel mask: %s\n", arg.c_str());
+                    return 2;
+                }
+                continue;
+            }
+            if (lowered == "--channels" || lowered == "--play") {
+                if (i + 1 >= argc) {
+                    std::fprintf(stderr, "--trainer-playback %s needs a channel mask.\n", arg.c_str());
+                    return 2;
+                }
+                if (!channel_mask_specified) {
+                    ClearPlaybackChannelMask(&mask);
+                    channel_mask_specified = true;
+                }
+                if (!ParsePlaybackChannelMask(argv[++i], &mask)) {
+                    std::fprintf(stderr, "invalid --trainer-playback channel mask: %s\n", argv[i]);
+                    return 2;
+                }
+                continue;
+            }
+            if (lowered.rfind("--trigger=", 0) == 0) {
+                if (!ParsePlaybackTrigger(arg.substr(10), &trigger)) {
+                    std::fprintf(stderr, "invalid --trainer-playback trigger: %s\n", arg.c_str());
+                    return 2;
+                }
+                continue;
+            }
+            if (lowered == "--trigger") {
+                if (i + 1 >= argc) {
+                    std::fprintf(stderr, "--trainer-playback --trigger needs a key or mouse button name.\n");
+                    return 2;
+                }
+                if (!ParsePlaybackTrigger(argv[++i], &trigger)) {
+                    std::fprintf(stderr, "invalid --trainer-playback trigger: %s\n", argv[i]);
+                    return 2;
+                }
+                continue;
+            }
+            if (!port_explicit && LooksLikeComPortArgument(arg)) {
+                port = arg;
+                port_explicit = true;
+                continue;
+            }
+            if (!channel_mask_specified) {
+                ClearPlaybackChannelMask(&mask);
+                channel_mask_specified = true;
+            }
+            if (!ParsePlaybackChannelMask(arg, &mask)) {
+                std::fprintf(stderr,
+                             "unrecognized --trainer-playback argument: %s\n",
+                             arg.c_str());
+                return 2;
+            }
+        }
+        if (!channel_mask_specified) {
+            mask = DefaultPlaybackChannelMask();
+        }
+        return RunTrainerPlayback(argv[2], port, loop, mask, trigger);
+    }
+
+    if (std::strcmp(argv[1], "--trainer-playback-bank") == 0) {
+        std::string port = "auto";
+        bool port_explicit = false;
+        bool loop = false;
+        std::vector<PlaybackBankSlotSpec> specs;
+        for (int i = 2; i < argc; ++i) {
+            std::string arg = argv[i];
+            const std::string lowered = ToLowerAscii(arg);
+            if (lowered == "once" || lowered == "--once") {
+                loop = false;
+                continue;
+            }
+            if (lowered == "loop" || lowered == "--loop") {
+                loop = true;
+                continue;
+            }
+            if (lowered.rfind("--port=", 0) == 0) {
+                port = arg.substr(7);
+                port_explicit = true;
+                continue;
+            }
+            if (lowered == "--port") {
+                if (i + 1 >= argc) {
+                    std::fprintf(stderr, "--trainer-playback-bank --port needs COM3 or auto.\n");
+                    return 2;
+                }
+                port = argv[++i];
+                port_explicit = true;
+                continue;
+            }
+            bool bind_blocks_live_input = false;
+            if (ParsePlaybackBindOptionName(lowered, &bind_blocks_live_input)) {
+                if (i + 3 >= argc) {
+                    std::fprintf(stderr,
+                                 "--trainer-playback-bank %s needs KEY CHANNELS RECORDING.\n",
+                                 arg.c_str());
+                    return 2;
+                }
+                if (specs.size() >= kMaxPlaybackBankSlots) {
+                    std::fprintf(stderr,
+                                 "--trainer-playback-bank supports at most %zu binding slots.\n",
+                                 kMaxPlaybackBankSlots);
+                    return 2;
+                }
+
+                PlaybackBankSlotSpec spec;
+                spec.block_live_input = bind_blocks_live_input;
+                const std::string trigger_text = argv[++i];
+                const std::string channels_text = argv[++i];
+                spec.recording_path = argv[++i];
+                ClearPlaybackChannelMask(&spec.mask);
+                if (!ParsePlaybackTrigger(trigger_text, &spec.trigger)) {
+                    std::fprintf(stderr,
+                                 "invalid --trainer-playback-bank bind trigger: %s\n",
+                                 trigger_text.c_str());
+                    return 2;
+                }
+                if (!ParsePlaybackChannelMask(channels_text, &spec.mask)) {
+                    std::fprintf(stderr,
+                                 "invalid --trainer-playback-bank bind channel mask: %s\n",
+                                 channels_text.c_str());
+                    return 2;
+                }
+                specs.push_back(std::move(spec));
+                continue;
+            }
+            if (!port_explicit && LooksLikeComPortArgument(arg)) {
+                port = arg;
+                port_explicit = true;
+                continue;
+            }
+
+            std::fprintf(stderr,
+                         "unrecognized --trainer-playback-bank argument: %s\n",
+                         arg.c_str());
+            return 2;
+        }
+        return RunTrainerPlaybackBank(port, loop, specs);
+    }
+
+    if (std::strcmp(argv[1], "--recording-info") == 0) {
+        if (argc < 3) {
+            std::fprintf(stderr, "--recording-info requires a recording file.\n");
+            return 2;
+        }
+        if (argc > 3) {
+            std::fprintf(stderr, "too many arguments for --recording-info.\n");
+            return 2;
+        }
+        return RunRecordingInfo(argv[2]);
+    }
+
+    if (std::strcmp(argv[1], "--recording-determinism-audit") == 0) {
+        if (argc < 4) {
+            std::fprintf(stderr,
+                         "--recording-determinism-audit requires RECORDING PROFILE [CHANNELS] [--timed-runs=N].\n");
+            return 2;
+        }
+
+        PlaybackChannelMask mask = DefaultPlaybackChannelMask();
+        bool channel_mask_specified = false;
+        int timed_runs = 0;
+        for (int i = 4; i < argc; ++i) {
+            const std::string arg = argv[i];
+            const std::string lowered = ToLowerAscii(arg);
+            if (lowered.rfind("--timed-runs=", 0) == 0) {
+                timed_runs = ParsePositiveIntLimit(arg.substr(13).c_str(), 0, 20);
+                if (timed_runs <= 0) {
+                    std::fprintf(stderr,
+                                 "invalid --recording-determinism-audit timed run count: %s\n",
+                                 arg.c_str());
+                    return 2;
+                }
+                continue;
+            }
+            if (lowered == "--timed-runs") {
+                if (i + 1 >= argc) {
+                    std::fprintf(stderr,
+                                 "--recording-determinism-audit --timed-runs needs a positive run count.\n");
+                    return 2;
+                }
+                timed_runs = ParsePositiveIntLimit(argv[++i], 0, 20);
+                if (timed_runs <= 0) {
+                    std::fprintf(stderr,
+                                 "invalid --recording-determinism-audit timed run count: %s\n",
+                                 argv[i]);
+                    return 2;
+                }
+                continue;
+            }
+            if (lowered.rfind("--channels=", 0) == 0) {
+                if (!channel_mask_specified) {
+                    ClearPlaybackChannelMask(&mask);
+                    channel_mask_specified = true;
+                }
+                if (!ParsePlaybackChannelMask(arg.substr(11), &mask)) {
+                    std::fprintf(stderr,
+                                 "invalid --recording-determinism-audit channel mask: %s\n",
+                                 arg.c_str());
+                    return 2;
+                }
+                continue;
+            }
+            if (lowered == "--channels") {
+                if (i + 1 >= argc) {
+                    std::fprintf(stderr,
+                                 "--recording-determinism-audit --channels needs a channel mask.\n");
+                    return 2;
+                }
+                if (!channel_mask_specified) {
+                    ClearPlaybackChannelMask(&mask);
+                    channel_mask_specified = true;
+                }
+                if (!ParsePlaybackChannelMask(argv[++i], &mask)) {
+                    std::fprintf(stderr,
+                                 "invalid --recording-determinism-audit channel mask: %s\n",
+                                 argv[i]);
+                    return 2;
+                }
+                continue;
+            }
+
+            if (!channel_mask_specified) {
+                ClearPlaybackChannelMask(&mask);
+                channel_mask_specified = true;
+            }
+            if (!ParsePlaybackChannelMask(arg, &mask)) {
+                std::fprintf(stderr,
+                             "unrecognized --recording-determinism-audit argument: %s\n",
+                             arg.c_str());
+                return 2;
+            }
+        }
+        if (!mask.Any()) {
+            std::fprintf(stderr, "--recording-determinism-audit needs at least one playback channel.\n");
+            return 2;
+        }
+        return RunRecordingDeterminismAudit(argv[2], argv[3], mask, timed_runs);
+    }
+
+    if (std::strcmp(argv[1], "--recording-self-test") == 0) {
+        if (argc != 2) {
+            std::fprintf(stderr, "too many arguments for --recording-self-test.\n");
+            return 2;
+        }
+        return RunRecordingSelfTest();
+    }
+
     if (std::strcmp(argv[1], "--trainer-profile") == 0 ||
         std::strcmp(argv[1], "--tune") == 0) {
         if (argc < 3) {
@@ -8608,20 +15510,194 @@ int main(int argc, char** argv) {
         }
         bool live_reload = false;
         bool saw_duration = false;
+        bool saw_recording_duration = false;
+        int recording_duration_seconds = 0;
+        TrainerRecordingOptions recording_options;
+        TrainerPlaybackBankOptions playback_bank_options;
+        TrainerRuntimeControlOptions runtime_control_options;
+        auto set_record_toggle_key = [&](const std::string& text) {
+            const std::string lowered = ToLowerAscii(TrimAscii(text));
+            if (lowered.empty() ||
+                lowered == "off" ||
+                lowered == "none" ||
+                lowered == "immediate") {
+                recording_options.toggle_key_vk = 0;
+                recording_options.toggle_key_label.clear();
+                return true;
+            }
+            const int vk = ParseTriggerVirtualKeyName(text);
+            if (vk <= 0) {
+                return false;
+            }
+            recording_options.toggle_key_vk = vk;
+            recording_options.toggle_key_label = TrimAscii(text);
+            return true;
+        };
+        auto set_recording_duration = [&](const std::string& text) {
+            const int parsed = ParsePositiveIntLimit(text.c_str(),
+                                                     0,
+                                                     kTrainerProfileMaxSeconds);
+            if (parsed <= 0) {
+                return false;
+            }
+            recording_duration_seconds = parsed;
+            saw_recording_duration = true;
+            return true;
+        };
         for (int i = 3; i < argc; ++i) {
-            if (_stricmp(argv[i], "live") == 0 || _stricmp(argv[i], "--live") == 0) {
+            const std::string arg = argv[i];
+            const std::string lowered = ToLowerAscii(arg);
+            if (lowered == "live" || lowered == "--live") {
                 live_reload = true;
                 continue;
             }
+            if (lowered == "--record-overwrite" ||
+                lowered == "--recording-overwrite" ||
+                lowered == "--overwrite-recording") {
+                recording_options.overwrite_existing = true;
+                continue;
+            }
+            if (lowered.rfind("--runtime-control=", 0) == 0 ||
+                lowered.rfind("--control=", 0) == 0) {
+                const size_t equals = arg.find('=');
+                runtime_control_options.path = equals == std::string::npos ? "" : arg.substr(equals + 1);
+                continue;
+            }
+            if (lowered == "--runtime-control" || lowered == "--control") {
+                if (i + 1 >= argc) {
+                    std::fprintf(stderr, "%s needs a runtime control file path.\n", arg.c_str());
+                    return 2;
+                }
+                runtime_control_options.path = argv[++i];
+                continue;
+            }
+            if (lowered.rfind("--recording=", 0) == 0 ||
+                lowered.rfind("--record=", 0) == 0) {
+                const size_t equals = arg.find('=');
+                recording_options.path = equals == std::string::npos ? "" : arg.substr(equals + 1);
+                continue;
+            }
+            if (lowered == "--recording" || lowered == "--record") {
+                if (i + 1 >= argc) {
+                    std::fprintf(stderr, "%s needs an output recording path.\n", arg.c_str());
+                    return 2;
+                }
+                recording_options.path = argv[++i];
+                continue;
+            }
+            if (lowered.rfind("--record-duration=", 0) == 0 ||
+                lowered.rfind("--record-seconds=", 0) == 0 ||
+                lowered.rfind("--recording-duration=", 0) == 0 ||
+                lowered.rfind("--recording-seconds=", 0) == 0) {
+                const size_t equals = arg.find('=');
+                const std::string value = equals == std::string::npos ? "" : arg.substr(equals + 1);
+                if (!set_recording_duration(value)) {
+                    std::fprintf(stderr, "invalid %s value: %s\n", argv[1], arg.c_str());
+                    return 2;
+                }
+                continue;
+            }
+            if (lowered == "--record-duration" ||
+                lowered == "--record-seconds" ||
+                lowered == "--recording-duration" ||
+                lowered == "--recording-seconds") {
+                if (i + 1 >= argc) {
+                    std::fprintf(stderr, "%s needs seconds.\n", arg.c_str());
+                    return 2;
+                }
+                if (!set_recording_duration(argv[++i])) {
+                    std::fprintf(stderr, "invalid %s value: %s\n", arg.c_str(), argv[i]);
+                    return 2;
+                }
+                continue;
+            }
+            if (lowered.rfind("--record-toggle=", 0) == 0 ||
+                lowered.rfind("--recording-toggle=", 0) == 0 ||
+                lowered.rfind("--record-key=", 0) == 0 ||
+                lowered.rfind("--recording-key=", 0) == 0) {
+                const size_t equals = arg.find('=');
+                const std::string value = equals == std::string::npos ? "" : arg.substr(equals + 1);
+                if (!set_record_toggle_key(value)) {
+                    std::fprintf(stderr, "invalid %s recording toggle key/button: %s\n", argv[1], arg.c_str());
+                    return 2;
+                }
+                continue;
+            }
+            if (lowered == "--record-toggle" ||
+                lowered == "--recording-toggle" ||
+                lowered == "--record-key" ||
+                lowered == "--recording-key") {
+                if (i + 1 >= argc) {
+                    std::fprintf(stderr, "%s needs a key or mouse button name such as F4, Space, or Mouse4.\n", arg.c_str());
+                    return 2;
+                }
+                if (!set_record_toggle_key(argv[++i])) {
+                    std::fprintf(stderr, "invalid %s recording toggle key/button: %s\n", argv[1], argv[i]);
+                    return 2;
+                }
+                continue;
+            }
+            if (lowered == "--playback-loop" ||
+                lowered == "--bank-loop" ||
+                lowered == "--bind-loop") {
+                playback_bank_options.loop = true;
+                continue;
+            }
+            if (lowered == "--playback-once" ||
+                lowered == "--bank-once" ||
+                lowered == "--bind-once") {
+                playback_bank_options.loop = false;
+                continue;
+            }
+            bool bind_blocks_live_input = false;
+            if (ParsePlaybackBindOptionName(lowered, &bind_blocks_live_input)) {
+                if (i + 3 >= argc) {
+                    std::fprintf(stderr,
+                                 "%s %s needs KEY CHANNELS RECORDING.\n",
+                                 argv[1],
+                                 arg.c_str());
+                    return 2;
+                }
+                if (playback_bank_options.specs.size() >= kMaxPlaybackBankSlots) {
+                    std::fprintf(stderr,
+                                 "%s supports at most %zu playback binding slots.\n",
+                                 argv[1],
+                                 kMaxPlaybackBankSlots);
+                    return 2;
+                }
+
+                PlaybackBankSlotSpec spec;
+                spec.block_live_input = bind_blocks_live_input;
+                const std::string trigger_text = argv[++i];
+                const std::string channels_text = argv[++i];
+                spec.recording_path = argv[++i];
+                ClearPlaybackChannelMask(&spec.mask);
+                if (!ParsePlaybackTrigger(trigger_text, &spec.trigger)) {
+                    std::fprintf(stderr,
+                                 "invalid %s playback bind trigger: %s\n",
+                                 argv[1],
+                                 trigger_text.c_str());
+                    return 2;
+                }
+                if (!ParsePlaybackChannelMask(channels_text, &spec.mask)) {
+                    std::fprintf(stderr,
+                                 "invalid %s playback bind channel mask: %s\n",
+                                 argv[1],
+                                 channels_text.c_str());
+                    return 2;
+                }
+                playback_bank_options.specs.push_back(std::move(spec));
+                continue;
+            }
             if (saw_duration) {
-                std::fprintf(stderr, "duplicate %s duration override: %s\n", argv[1], argv[i]);
+                std::fprintf(stderr, "duplicate %s duration override: %s\n", argv[1], arg.c_str());
                 return 2;
             }
-            profile.seconds = ParsePositiveIntLimit(argv[i],
+            profile.seconds = ParsePositiveIntLimit(arg.c_str(),
                                                     profile.seconds,
                                                     kTrainerProfileMaxSeconds);
             if (profile.seconds <= 0) {
-                std::fprintf(stderr, "invalid %s duration override: %s\n", argv[1], argv[i]);
+                std::fprintf(stderr, "invalid %s duration override: %s\n", argv[1], arg.c_str());
                 return 2;
             }
             saw_duration = true;
@@ -8629,8 +15705,12 @@ int main(int argc, char** argv) {
                 return 2;
             }
         }
+        if (recording_options.Enabled()) {
+            recording_options.max_seconds = saw_recording_duration ? recording_duration_seconds : 0;
+            recording_options.start_immediately = !recording_options.ToggleMode();
+        }
         const bool guided = std::strcmp(argv[1], "--tune") == 0;
-        return RunTrainerProfile(profile, guided, live_reload);
+        return RunTrainerProfile(profile, guided, live_reload, recording_options, playback_bank_options, runtime_control_options);
     }
 
     if (std::strcmp(argv[1], "--mouse-aim-dry-run") == 0) {
@@ -8791,4 +15871,3 @@ int main(int argc, char** argv) {
     PrintUsage();
     return 2;
 }
-

@@ -616,6 +616,10 @@
                                         <RowDefinition Height="Auto" />
                                         <RowDefinition Height="Auto" />
                                         <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
                                     </Grid.RowDefinitions>
 
                                     <TextBlock Grid.Row="0" Grid.Column="0" Text="Profile file" Style="{StaticResource MutedTextStyle}" />
@@ -743,14 +747,18 @@
                                           Style="{StaticResource EditorCheckBoxStyle}" />
                             </WrapPanel>
 
-                            <TextBlock Grid.Row="2" Grid.Column="0" Text="Stop key" Style="{StaticResource FieldLabelStyle}" />
+                            <TextBlock Grid.Row="2" Grid.Column="0" Text="Start/stop key" Style="{StaticResource FieldLabelStyle}" />
                             <TextBox Grid.Row="2" Grid.Column="1"
-                                     Text="{Binding Editor.StopKey, UpdateSourceTrigger=LostFocus}"
-                                     Style="{StaticResource EditorTextBoxStyle}" />
+                                     Text="{Binding Editor.StopKey, UpdateSourceTrigger=PropertyChanged}"
+                                     Style="{StaticResource EditorTextBoxStyle}"
+                                     controls:HotkeyCapture.IsEnabled="True"
+                                     ToolTip="Click, then press the key. Delete clears the value." />
                             <TextBlock Grid.Row="2" Grid.Column="2" Text="Freeze key" Style="{StaticResource FieldLabelStyle}" />
                             <TextBox Grid.Row="2" Grid.Column="3"
-                                     Text="{Binding Editor.FreezeKey, UpdateSourceTrigger=LostFocus}"
-                                     Style="{StaticResource EditorTextBoxStyle}" />
+                                     Text="{Binding Editor.FreezeKey, UpdateSourceTrigger=PropertyChanged}"
+                                     Style="{StaticResource EditorTextBoxStyle}"
+                                     controls:HotkeyCapture.IsEnabled="True"
+                                     ToolTip="Click, then press the key. Delete clears the value." />
                         </Grid>
                     </Border>
 
@@ -858,6 +866,7 @@
                                             <RowDefinition Height="Auto" />
                                             <RowDefinition Height="Auto" />
                                             <RowDefinition Height="Auto" />
+                                            <RowDefinition Height="Auto" />
                                         </Grid.RowDefinitions>
 
                                         <CheckBox Grid.Row="0" Grid.Column="0" Grid.ColumnSpan="2"
@@ -888,6 +897,7 @@
                                             <ColumnDefinition Width="*" />
                                         </Grid.ColumnDefinitions>
                                         <Grid.RowDefinitions>
+                                            <RowDefinition Height="Auto" />
                                             <RowDefinition Height="Auto" />
                                             <RowDefinition Height="Auto" />
                                             <RowDefinition Height="Auto" />
@@ -1058,6 +1068,8 @@
                                         <Grid.RowDefinitions>
                                             <RowDefinition Height="Auto" />
                                             <RowDefinition Height="Auto" />
+                                            <RowDefinition Height="Auto" />
+                                            <RowDefinition Height="Auto" />
                                         </Grid.RowDefinitions>
                                         <TextBlock Grid.Row="0" Grid.Column="0" Text="Elastic mode" Style="{StaticResource FieldLabelStyle}" />
                                         <ComboBox Grid.Row="0" Grid.Column="1"
@@ -1070,10 +1082,32 @@
                                             <ComboBoxItem Content="Smoothstep" Tag="smoothstep" />
                                             <ComboBoxItem Content="Expo" Tag="expo" />
                                         </ComboBox>
-                                        <TextBlock Grid.Row="1" Grid.Column="0" Text="Elastic coeff" Style="{StaticResource FieldLabelStyle}" />
-                                        <TextBox Grid.Row="1" Grid.Column="1" Text="{Binding Editor.ElasticReturnCoefficient, UpdateSourceTrigger=LostFocus}" Style="{StaticResource EditorTextBoxStyle}" />
-                                        <TextBlock Grid.Row="1" Grid.Column="2" Text="Elastic curve" Style="{StaticResource FieldLabelStyle}" />
-                                        <TextBox Grid.Row="1" Grid.Column="3" Text="{Binding Editor.ElasticReturnCurve, UpdateSourceTrigger=LostFocus}" Style="{StaticResource EditorTextBoxStyle}" />
+                                        <TextBlock Grid.Row="0" Grid.Column="2" Text="Spring timing" Style="{StaticResource FieldLabelStyle}" />
+                                        <ComboBox Grid.Row="0" Grid.Column="3"
+                                                  SelectedValue="{Binding Editor.ElasticReturnActivation, Mode=TwoWay}"
+                                                  SelectedValuePath="Tag"
+                                                  Style="{StaticResource EditorComboBoxStyle}"
+                                                  ToolTip="Always keeps elastic return active on zero-input ticks. While moving uses Elastic coeff while mouse input is present, then fades toward Idle coeff after input stops.">
+                                            <ComboBoxItem Content="Always" Tag="always" />
+                                            <ComboBoxItem Content="While moving" Tag="while_moving" />
+                                        </ComboBox>
+                                        <TextBlock Grid.Row="1" Grid.Column="0" Text="Return metric" Style="{StaticResource FieldLabelStyle}" />
+                                        <ComboBox Grid.Row="1" Grid.Column="1"
+                                                  SelectedValue="{Binding Editor.ElasticReturnMetric, Mode=TwoWay}"
+                                                  SelectedValuePath="Tag"
+                                                  Style="{StaticResource EditorComboBoxStyle}"
+                                                  ToolTip="Axis keeps independent-axis return. Diagonal normalized applies one 2D return vector so diagonals do not pull harder than cardinals.">
+                                            <ComboBoxItem Content="Axis" Tag="axis" />
+                                            <ComboBoxItem Content="Diagonal normalized" Tag="diagonal_normalized" />
+                                        </ComboBox>
+                                        <TextBlock Grid.Row="2" Grid.Column="0" Text="Elastic coeff" Style="{StaticResource FieldLabelStyle}" />
+                                        <TextBox Grid.Row="2" Grid.Column="1" Text="{Binding Editor.ElasticReturnCoefficient, UpdateSourceTrigger=LostFocus}" Style="{StaticResource EditorTextBoxStyle}" />
+                                        <TextBlock Grid.Row="2" Grid.Column="2" Text="Elastic curve" Style="{StaticResource FieldLabelStyle}" />
+                                        <TextBox Grid.Row="2" Grid.Column="3" Text="{Binding Editor.ElasticReturnCurve, UpdateSourceTrigger=LostFocus}" Style="{StaticResource EditorTextBoxStyle}" />
+                                        <TextBlock Grid.Row="3" Grid.Column="0" Text="Idle coeff" Style="{StaticResource FieldLabelStyle}" />
+                                        <TextBox Grid.Row="3" Grid.Column="1" Text="{Binding Editor.ElasticReturnIdleCoefficient, UpdateSourceTrigger=LostFocus}" Style="{StaticResource EditorTextBoxStyle}" />
+                                        <TextBlock Grid.Row="3" Grid.Column="2" Text="Taper ms" Style="{StaticResource FieldLabelStyle}" />
+                                        <TextBox Grid.Row="3" Grid.Column="3" Text="{Binding Editor.ElasticReturnTaperMs, UpdateSourceTrigger=LostFocus}" Style="{StaticResource EditorTextBoxStyle}" />
                                     </Grid>
                                 </StackPanel>
                             </Grid>
@@ -1518,6 +1552,454 @@
                                 </DataGrid.Columns>
                             </DataGrid>
                         </Grid>
+                    </Border>
+
+                            </StackPanel>
+                        </ScrollViewer>
+                    </TabItem>
+
+                    <TabItem Header="Recordings">
+                        <ScrollViewer VerticalScrollBarVisibility="Auto">
+                            <StackPanel Margin="0,14,0,0">
+
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="1.05*" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+
+                        <StackPanel Grid.Column="0" Margin="0,0,10,0">
+                            <TextBlock Text="Capture" Style="{StaticResource SectionTitleStyle}" />
+                            <Border Style="{StaticResource RaisedBlockStyle}">
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="132" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                    </Grid.RowDefinitions>
+
+                                    <TextBlock Grid.Row="0"
+                                               Grid.Column="0"
+                                               Text="Recording file"
+                                               Style="{StaticResource FieldLabelStyle}" />
+                                    <TextBox Grid.Row="0"
+                                             Grid.Column="1"
+                                             Text="{Binding RecordingPath, UpdateSourceTrigger=PropertyChanged}"
+                                             Style="{StaticResource EditorTextBoxStyle}"
+                                             FontFamily="Consolas"
+                                             HorizontalScrollBarVisibility="Auto"
+                                             TextWrapping="NoWrap"
+                                             ToolTip="Relative paths are resolved from the app folder." />
+                                    <Button Grid.Row="0"
+                                            Grid.Column="2"
+                                            Content="Save as"
+                                            Command="{Binding ChooseRecordingPathCommand}"
+                                            Style="{StaticResource CompactButtonStyle}"
+                                            Margin="8,0,0,6"
+                                            ToolTip="Choose the recording folder and file name." />
+
+                                    <TextBlock Grid.Row="1"
+                                               Grid.Column="0"
+                                               Text="Duration"
+                                               Style="{StaticResource FieldLabelStyle}" />
+                                    <TextBox Grid.Row="1"
+                                             Grid.Column="1"
+                                             Text="{Binding RecordingDurationSeconds, UpdateSourceTrigger=PropertyChanged}"
+                                             Style="{StaticResource EditorTextBoxStyle}"
+                                             MinWidth="72"
+                                             ToolTip="Timed capture length in seconds, 1..3600." />
+                                    <CheckBox Grid.Row="1"
+                                              Grid.Column="2"
+                                              Grid.ColumnSpan="2"
+                                              Content="Live reload"
+                                              IsChecked="{Binding RecordingLiveReload, Mode=TwoWay}"
+                                              Style="{StaticResource EditorCheckBoxStyle}"
+                                              ToolTip="Pass live to gx12mouse while recording." />
+
+                                    <TextBlock Grid.Row="2"
+                                               Grid.Column="0"
+                                               Text="Record key"
+                                               Style="{StaticResource FieldLabelStyle}" />
+                                    <TextBox Grid.Row="2"
+                                             Grid.Column="1"
+                                             Text="{Binding RecordingToggleKey, UpdateSourceTrigger=PropertyChanged}"
+                                             Style="{StaticResource EditorTextBoxStyle}"
+                                             MinWidth="72"
+                                             controls:HotkeyCapture.IsEnabled="True"
+                                             controls:HotkeyCapture.ClearValue="off"
+                                             ToolTip="Click, then press the key or mouse button. Delete sets off for immediate timed recording." />
+                                    <CheckBox Grid.Row="2"
+                                              Grid.Column="2"
+                                              Grid.ColumnSpan="2"
+                                              Content="Overwrite file"
+                                              IsChecked="{Binding RecordingOverwrite, Mode=TwoWay}"
+                                              Style="{StaticResource EditorCheckBoxStyle}"
+                                              ToolTip="Record to the selected file name instead of creating numbered clips." />
+
+                                    <WrapPanel Grid.Row="3"
+                                               Grid.Column="0"
+                                               Grid.ColumnSpan="4"
+                                               Margin="0,2,0,4">
+                                        <Button Content="Copy record"
+                                                Command="{Binding CopyRecordingCommandLineCommand}"
+                                                Style="{StaticResource CompactButtonStyle}"
+                                                Margin="0,0,8,6"
+                                                ToolTip="{Binding RecordingCommandLine}" />
+                                        <Button Content="{Binding RecordingInfoButtonText}"
+                                                Command="{Binding InspectRecordingCommand}"
+                                                Style="{StaticResource CompactButtonStyle}"
+                                                Margin="0,0,8,6"
+                                                ToolTip="{Binding RecordingInfoCommandLine}" />
+                                        <Button Content="Copy info"
+                                                Command="{Binding CopyRecordingInfoCommandLineCommand}"
+                                                Style="{StaticResource CompactButtonStyle}"
+                                                Margin="0,0,8,6"
+                                                ToolTip="{Binding RecordingInfoCommandLine}" />
+                                    </WrapPanel>
+
+                                    <TextBlock Grid.Row="4"
+                                               Grid.Column="0"
+                                               Grid.ColumnSpan="4"
+                                               Text="{Binding RecordingBufferStatusText}"
+                                               Style="{StaticResource MutedTextStyle}"
+                                               Margin="0,0,0,6" />
+
+                                    <TextBox Grid.Row="5"
+                                             Grid.Column="0"
+                                             Grid.ColumnSpan="4"
+                                             Text="{Binding RecordingCommandLine, Mode=OneWay}"
+                                             IsReadOnly="True"
+                                             FontFamily="Consolas"
+                                             FontSize="11"
+                                             Height="58"
+                                             TextWrapping="Wrap"
+                                             VerticalScrollBarVisibility="Auto"
+                                             HorizontalScrollBarVisibility="Auto"
+                                             ToolTip="Copyable gx12mouse --trainer-record command." />
+                                </Grid>
+                            </Border>
+                        </StackPanel>
+
+                        <StackPanel Grid.Column="1" Margin="10,0,0,0">
+                            <TextBlock Text="Playback" Style="{StaticResource SectionTitleStyle}" />
+                            <Border Style="{StaticResource RaisedBlockStyle}">
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="96" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="86" />
+                                        <ColumnDefinition Width="*" />
+                                    </Grid.ColumnDefinitions>
+                                     <Grid.RowDefinitions>
+                                         <RowDefinition Height="Auto" />
+                                         <RowDefinition Height="Auto" />
+                                         <RowDefinition Height="Auto" />
+                                         <RowDefinition Height="Auto" />
+                                         <RowDefinition Height="Auto" />
+                                         <RowDefinition Height="Auto" />
+                                         <RowDefinition Height="Auto" />
+                                         <RowDefinition Height="Auto" />
+                                         <RowDefinition Height="Auto" />
+                                         <RowDefinition Height="Auto" />
+                                     </Grid.RowDefinitions>
+
+                                    <TextBlock Grid.Row="0"
+                                               Grid.Column="0"
+                                               Text="File"
+                                               Style="{StaticResource FieldLabelStyle}" />
+                                    <TextBox Grid.Row="0"
+                                             Grid.Column="1"
+                                             Grid.ColumnSpan="2"
+                                             Text="{Binding PlaybackRecordingPath, UpdateSourceTrigger=PropertyChanged}"
+                                             Style="{StaticResource EditorTextBoxStyle}"
+                                             FontFamily="Consolas"
+                                             HorizontalScrollBarVisibility="Auto"
+                                             TextWrapping="NoWrap"
+                                             ToolTip="Recording file to play back." />
+                                    <Button Grid.Row="0"
+                                            Grid.Column="3"
+                                            Content="Open"
+                                            Command="{Binding ChoosePlaybackPathCommand}"
+                                            Style="{StaticResource CompactButtonStyle}"
+                                            Margin="8,0,0,6"
+                                            HorizontalAlignment="Right"
+                                            ToolTip="Choose a recording file to play back." />
+
+                                    <TextBlock Grid.Row="1"
+                                               Grid.Column="0"
+                                               Text="Port"
+                                               Style="{StaticResource FieldLabelStyle}" />
+                                    <TextBox Grid.Row="1"
+                                             Grid.Column="1"
+                                             Text="{Binding PlaybackPort, UpdateSourceTrigger=PropertyChanged}"
+                                             Style="{StaticResource EditorTextBoxStyle}"
+                                             ToolTip="Use auto or a COM port such as COM6." />
+                                    <TextBlock Grid.Row="1"
+                                               Grid.Column="2"
+                                               Text="Trigger"
+                                               Style="{StaticResource FieldLabelStyle}" />
+                                    <TextBox Grid.Row="1"
+                                             Grid.Column="3"
+                                             Text="{Binding PlaybackTrigger, UpdateSourceTrigger=PropertyChanged}"
+                                             Style="{StaticResource EditorTextBoxStyle}"
+                                             controls:HotkeyCapture.IsEnabled="True"
+                                             controls:HotkeyCapture.ClearValue="off"
+                                             ToolTip="Click, then press the key or mouse button. Delete disables the inline playback bind." />
+
+                                    <TextBlock Grid.Row="2"
+                                               Grid.Column="0"
+                                               Text="Channels"
+                                               Style="{StaticResource FieldLabelStyle}" />
+                                    <WrapPanel Grid.Row="2"
+                                               Grid.Column="1"
+                                               Grid.ColumnSpan="3">
+                                        <CheckBox Content="Ail"
+                                                  IsChecked="{Binding PlaybackAileron, Mode=TwoWay}"
+                                                  Style="{StaticResource EditorCheckBoxStyle}"
+                                                  ToolTip="Replay recorded aileron on channel 1." />
+                                        <CheckBox Content="Ele"
+                                                  IsChecked="{Binding PlaybackElevator, Mode=TwoWay}"
+                                                  Style="{StaticResource EditorCheckBoxStyle}"
+                                                  ToolTip="Replay recorded elevator on channel 2." />
+                                        <CheckBox Content="Thr"
+                                                  IsChecked="{Binding PlaybackThrottle, Mode=TwoWay}"
+                                                  Style="{StaticResource EditorCheckBoxStyle}"
+                                                  ToolTip="Replay recorded throttle on channel 3." />
+                                        <CheckBox Content="Rud"
+                                                  IsChecked="{Binding PlaybackRudder, Mode=TwoWay}"
+                                                  Style="{StaticResource EditorCheckBoxStyle}"
+                                                  ToolTip="Replay recorded rudder on channel 4." />
+                                        <TextBlock Text="{Binding PlaybackChannelMask}"
+                                                   Style="{StaticResource MutedTextStyle}"
+                                                   VerticalAlignment="Center"
+                                                   Margin="0,0,0,8" />
+                                    </WrapPanel>
+
+                                    <WrapPanel Grid.Row="3"
+                                               Grid.Column="1"
+                                               Grid.ColumnSpan="2">
+                                        <CheckBox Content="Loop"
+                                                  IsChecked="{Binding PlaybackLoop, Mode=TwoWay}"
+                                                  Style="{StaticResource EditorCheckBoxStyle}"
+                                                  ToolTip="Repeat the recording until stopped." />
+                                        <CheckBox Content="Radio right gimbal"
+                                                  IsChecked="{Binding PlaybackRadioRightGimbal, Mode=TwoWay}"
+                                                  Style="{StaticResource EditorCheckBoxStyle}"
+                                                  ToolTip="Use recorded GX12 HID ch1/ch2 for Ail/Ele instead of the PC mouse track." />
+                                        <CheckBox Content="Recorded trainer right"
+                                                  IsChecked="{Binding PlaybackRecordedTrainerRight, Mode=TwoWay}"
+                                                  Style="{StaticResource EditorCheckBoxStyle}"
+                                                  ToolTip="Use the recorded final trainer ch1/ch2 values instead of re-running the PC mouse mapper." />
+                                        <CheckBox Content="Radio left gimbal"
+                                                  IsChecked="{Binding PlaybackRadioLeftGimbal, Mode=TwoWay}"
+                                                  Style="{StaticResource EditorCheckBoxStyle}"
+                                                  ToolTip="Use recorded GX12 HID ch3/ch4 for Thr/Rud instead of the PC left-source track." />
+                                        <CheckBox Content="Recorded trainer left"
+                                                  IsChecked="{Binding PlaybackRecordedTrainerLeft, Mode=TwoWay}"
+                                                  Style="{StaticResource EditorCheckBoxStyle}"
+                                                  ToolTip="Use the recorded final trainer ch3/ch4 values instead of re-running the PC left-source mapper." />
+                                        <CheckBox Content="Block live input"
+                                                  IsChecked="{Binding PlaybackBlockLiveInput, Mode=TwoWay}"
+                                                  Style="{StaticResource EditorCheckBoxStyle}"
+                                                  ToolTip="Ignore live input on the channels this playback bind controls while it is active." />
+                                    </WrapPanel>
+                                    <WrapPanel Grid.Row="3"
+                                               Grid.Column="3"
+                                               HorizontalAlignment="Right">
+                                        <Button Content="Copy playback"
+                                                Command="{Binding CopyPlaybackCommandLineCommand}"
+                                                Style="{StaticResource CompactButtonStyle}"
+                                                Margin="0,0,0,6"
+                                                ToolTip="{Binding PlaybackCommandLine}" />
+                                    </WrapPanel>
+
+                                    <TextBlock Grid.Row="4"
+                                               Grid.Column="0"
+                                               Grid.ColumnSpan="4"
+                                               Text="{Binding RecordingBufferStatusText}"
+                                               Style="{StaticResource MutedTextStyle}"
+                                               Margin="0,0,0,6" />
+
+                                    <TextBox Grid.Row="5"
+                                             Grid.Column="0"
+                                             Grid.ColumnSpan="4"
+                                             Text="{Binding PlaybackCommandLine, Mode=OneWay}"
+                                             IsReadOnly="True"
+                                             FontFamily="Consolas"
+                                             FontSize="11"
+                                             Height="58"
+                                             TextWrapping="Wrap"
+                                             VerticalScrollBarVisibility="Auto"
+                                             HorizontalScrollBarVisibility="Auto"
+                                             ToolTip="Copyable gx12mouse --trainer-profile command with this playback bind." />
+
+                                    <Grid Grid.Row="6"
+                                          Grid.Column="0"
+                                          Grid.ColumnSpan="4"
+                                          Margin="0,10,0,4">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock Grid.Column="0"
+                                                   Text="Playback binds"
+                                                   Style="{StaticResource SectionTitleStyle}"
+                                                   Margin="0,0,0,0" />
+                                        <TextBlock Grid.Column="1"
+                                                   Text="{Binding PlaybackBindingLimitText}"
+                                                   Style="{StaticResource MutedTextStyle}"
+                                                   VerticalAlignment="Center"
+                                                   Margin="0,0,10,0" />
+                                        <CheckBox Grid.Column="2"
+                                                  Content="Add bind"
+                                                  IsChecked="{Binding AddPlaybackBindingToggle, Mode=TwoWay}"
+                                                  IsEnabled="{Binding CanAddPlaybackBinding}"
+                                                  Style="{StaticResource EditorCheckBoxStyle}"
+                                                  ToolTip="Adds another playback hotkey row, up to 12." />
+                                    </Grid>
+
+                                    <Grid Grid.Row="6"
+                                          Grid.Column="0"
+                                          Grid.ColumnSpan="4"
+                                          Margin="0,0,0,4">
+                                        <Grid.RowDefinitions>
+                                            <RowDefinition Height="Auto" />
+                                            <RowDefinition Height="Auto" />
+                                        </Grid.RowDefinitions>
+                                        <Grid Grid.Row="0" Margin="0,0,0,2">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="76" />
+                                                <ColumnDefinition Width="70" />
+                                                <ColumnDefinition Width="*" />
+                                                <ColumnDefinition Width="76" />
+                                                <ColumnDefinition Width="96" />
+                                                <ColumnDefinition Width="86" />
+                                            </Grid.ColumnDefinitions>
+                                            <TextBlock Grid.Column="0" Text="On" Style="{StaticResource MetricLabelStyle}" />
+                                            <TextBlock Grid.Column="1" Text="Key" Style="{StaticResource MetricLabelStyle}" />
+                                            <TextBlock Grid.Column="2" Text="Recording" Style="{StaticResource MetricLabelStyle}" />
+                                            <TextBlock Grid.Column="4" Text="Channels" Style="{StaticResource MetricLabelStyle}" />
+                                            <TextBlock Grid.Column="5" Text="Live" Style="{StaticResource MetricLabelStyle}" />
+                                        </Grid>
+                                        <ScrollViewer Grid.Row="1"
+                                                      MaxHeight="178"
+                                                      VerticalScrollBarVisibility="Auto">
+                                            <ItemsControl ItemsSource="{Binding PlaybackBindings}">
+                                                <ItemsControl.ItemTemplate>
+                                                    <DataTemplate>
+                                                        <Grid Margin="0,0,0,5">
+                                                            <Grid.ColumnDefinitions>
+                                                                <ColumnDefinition Width="76" />
+                                                                <ColumnDefinition Width="70" />
+                                                                <ColumnDefinition Width="*" />
+                                                                <ColumnDefinition Width="76" />
+                                                                <ColumnDefinition Width="96" />
+                                                                <ColumnDefinition Width="86" />
+                                                            </Grid.ColumnDefinitions>
+                                                            <CheckBox Grid.Column="0"
+                                                                      Content="{Binding SlotNumber, StringFormat=Bind {0}}"
+                                                                      IsChecked="{Binding IsEnabled, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                                                      Style="{StaticResource EditorCheckBoxStyle}"
+                                                                      ToolTip="Turn this bind off to remove it from the playback bank." />
+                                                            <TextBox Grid.Column="1"
+                                                                     Text="{Binding Trigger, UpdateSourceTrigger=PropertyChanged}"
+                                                                     Style="{StaticResource EditorTextBoxStyle}"
+                                                                     Margin="0,0,6,4"
+                                                                     controls:HotkeyCapture.IsEnabled="True"
+                                                                     ToolTip="Click, then press the key or mouse button for this playback file." />
+                                                            <TextBox Grid.Column="2"
+                                                                     Text="{Binding RecordingPath, UpdateSourceTrigger=PropertyChanged}"
+                                                                     Style="{StaticResource EditorTextBoxStyle}"
+                                                                     FontFamily="Consolas"
+                                                                     HorizontalScrollBarVisibility="Auto"
+                                                                     TextWrapping="NoWrap"
+                                                                     Margin="0,0,6,4"
+                                                                     ToolTip="Recording file for this playback hotkey. Relative paths resolve from the app folder." />
+                                                            <Button Grid.Column="3"
+                                                                    Content="Open"
+                                                                    Command="{Binding DataContext.ChoosePlaybackBindingPathCommand, RelativeSource={RelativeSource AncestorType={x:Type Window}}}"
+                                                                    CommandParameter="{Binding}"
+                                                                    Style="{StaticResource CompactButtonStyle}"
+                                                                    Margin="0,0,6,4"
+                                                                    ToolTip="Choose the recording file for this playback hotkey." />
+                                                            <TextBox Grid.Column="4"
+                                                                     Text="{Binding ChannelMask, UpdateSourceTrigger=PropertyChanged}"
+                                                                     Style="{StaticResource EditorTextBoxStyle}"
+                                                                     FontFamily="Consolas"
+                                                                     Margin="0,0,0,4"
+                                                                     ToolTip="Channels for this bind, for example ail,ele,thr,rud or radio_ail,radio_ele,radio_thr,radio_rud." />
+                                                            <CheckBox Grid.Column="5"
+                                                                      Content="Block"
+                                                                      IsChecked="{Binding BlockLiveInput, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                                                      Style="{StaticResource EditorCheckBoxStyle}"
+                                                                      Margin="8,0,0,4"
+                                                                      ToolTip="Ignore live input on this bind's selected playback channels until the clip stops." />
+                                                        </Grid>
+                                                    </DataTemplate>
+                                                </ItemsControl.ItemTemplate>
+                                            </ItemsControl>
+                                        </ScrollViewer>
+                                    </Grid>
+
+                                    <WrapPanel Grid.Row="7"
+                                               Grid.Column="0"
+                                               Grid.ColumnSpan="4"
+                                               HorizontalAlignment="Right">
+                                        <Button Content="Copy bank"
+                                                Command="{Binding CopyPlaybackBankCommandLineCommand}"
+                                                Style="{StaticResource CompactButtonStyle}"
+                                                Margin="0,0,0,6"
+                                                ToolTip="{Binding PlaybackBankCommandLine}" />
+                                    </WrapPanel>
+
+                                    <TextBox Grid.Row="8"
+                                             Grid.Column="0"
+                                             Grid.ColumnSpan="4"
+                                             Text="{Binding PlaybackBankCommandLine, Mode=OneWay}"
+                                             IsReadOnly="True"
+                                             FontFamily="Consolas"
+                                             FontSize="11"
+                                             Height="58"
+                                             TextWrapping="Wrap"
+                                             VerticalScrollBarVisibility="Auto"
+                                             HorizontalScrollBarVisibility="Auto"
+                                             ToolTip="Copyable gx12mouse --trainer-playback-bank command." />
+
+                                    <TextBlock Grid.Row="9"
+                                               Grid.Column="0"
+                                               Grid.ColumnSpan="4"
+                                               Text="{Binding RecordingStatusText}"
+                                               Style="{StaticResource MutedTextStyle}"
+                                               TextWrapping="NoWrap"
+                                               TextTrimming="CharacterEllipsis"
+                                               Margin="0,8,0,0" />
+                                </Grid>
+                            </Border>
+                        </StackPanel>
+                    </Grid>
+
+                    <TextBlock Text="Recording Info" Style="{StaticResource SectionTitleStyle}" Margin="0,6,0,8" />
+                    <Border Style="{StaticResource RaisedBlockStyle}">
+                        <TextBox Text="{Binding RecordingInfoText, Mode=OneWay}"
+                                 IsReadOnly="True"
+                                 AcceptsReturn="True"
+                                 AcceptsTab="True"
+                                 FontFamily="Consolas"
+                                 FontSize="11"
+                                 Height="220"
+                                 VerticalScrollBarVisibility="Auto"
+                                 HorizontalScrollBarVisibility="Auto"
+                                 TextWrapping="NoWrap" />
                     </Border>
 
                             </StackPanel>

@@ -104,6 +104,11 @@ USBD_StatusTypeDef USBD_Init(USBD_HandleTypeDef *pdev,
   }
 
 #ifdef USE_USBD_COMPOSITE
+  /* The composite descriptor builder keeps descriptor size in static storage.
+     Rebuild each USB stack instance from an empty descriptor so repeated
+     hotplug starts do not append CDC/HID descriptors from a previous run. */
+  (void)USBD_CMPST_ClearConfDesc(pdev);
+
   /* Parse the table of classes in use */
   for (uint32_t i = 0; i < USBD_MAX_SUPPORTED_CLASS; i++)
   {

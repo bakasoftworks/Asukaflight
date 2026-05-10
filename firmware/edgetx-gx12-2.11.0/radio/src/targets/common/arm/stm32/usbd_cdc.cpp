@@ -64,6 +64,7 @@ volatile uint32_t APP_Tx_ptr_out = 0;
   */
 
 extern USBD_HandleTypeDef hUsbDevice;
+extern "C" bool usbRestartPending();
 #if defined(USE_USBD_COMPOSITE)
 static constexpr uint8_t USB_CDC_COMPOSITE_CLASS_ID = 0;
 #endif
@@ -276,6 +277,9 @@ static int8_t VCP_StartOfFrame_FS()
       (USBD_CDC_HandleTypeDef*)hUsbDevice.pClassData;
 #endif
 
+    if (hcdc == nullptr)
+      return USBD_OK;
+
     if (hcdc->TxState != 0)
       return USBD_OK;
 
@@ -336,7 +340,7 @@ void usbSerialPutc(void*, uint8_t c)
     of the physical USB connection.
   */
 
-  if (!cdcConnected) return;
+  if (!cdcConnected || usbRestartPending()) return;
 
   /*
     k and associated variables must be modified
