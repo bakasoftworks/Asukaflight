@@ -143,7 +143,7 @@ The script expects a current native runtime at
 fixed UI sprites, strips `.pdb` files, runs the packaged self-test, adds the
 validated GX12 firmware as `firmware\R2X-871.BIN`, flash/run instructions, and
 a SHA256 manifest, then creates a flattened zip such as
-`dist\Asukaflight-0.9.0-p2-win-x64.zip`.
+`dist\Asukaflight-0.9.0-p3-win-x64.zip`.
 Experimental TX16S/TX16S MK3 firmware candidates, when present, are packaged
 under `firmware\TX16S-EXPERIMENTAL\` with separate warnings.
 
