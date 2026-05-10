@@ -3,7 +3,7 @@ param(
     [string]$Configuration = "Release",
     [string]$RuntimeIdentifier = "win-x64",
     [string]$FirmwarePath = "",
-    [string]$FirmwareSdFileName = "R2X-871.BIN",
+    [string]$FirmwareSdFileName = "R2X-7D8.BIN",
     [string]$ExperimentalTx16sClassicFirmwarePath = "",
     [string]$ExperimentalTx16sMk3Uf2Path = "",
     [string]$ExperimentalTx16sMk3BinPath = "",
@@ -213,7 +213,7 @@ function Assert-NoForbiddenReleaseStringsInZip {
 }
 
 if ([string]::IsNullOrWhiteSpace($FirmwarePath)) {
-    $FirmwarePath = Join-Path $repoRoot "firmware\R2X-871.BIN"
+    $FirmwarePath = Join-Path $repoRoot "firmware\R2X-7D8.BIN"
 }
 
 if ([string]::IsNullOrWhiteSpace($ExperimentalTx16sClassicFirmwarePath)) {
@@ -277,7 +277,7 @@ function Get-ReadmeUserDirections {
     return $section
 }
 
-$expectedFirmwareHash = "8717A5BE0DD1A536AC7F5718CCD3F50F4DA835B889DCCBF56EEB44AA19FED71A"
+$expectedFirmwareHash = "7D8FAE80FDC88E872832DEDAABB0DE3DCAC47125DC35386BE8FE5B9EE0FCE071"
 $firmwareHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $FirmwarePath).Hash
 if (-not [string]::Equals($firmwareHash, $expectedFirmwareHash, [System.StringComparison]::OrdinalIgnoreCase)) {
     throw "Firmware hash mismatch for $FirmwarePath. Expected $expectedFirmwareHash, got $firmwareHash."

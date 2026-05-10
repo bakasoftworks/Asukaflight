@@ -65,10 +65,10 @@ To set up a Radiomaster GX12 model for Asukaflight, first download the latest .z
 
 1. Power on the radio in bootloader mode by holding the horizontal trim buttons
    (T1/T4) together.
-2. Plug the radio into the computer and copy `firmware\R2X-871.BIN` from the
+2. Plug the radio into the computer and copy `firmware\R2X-7D8.BIN` from the
    extracted package to the radio's `FIRMWARE` folder.
 3. Back up models and current firmware before flashing if you wish.
-4. Unplug USB, choose `Write Firmware`, and select `R2X-871.BIN`.
+4. Unplug USB, choose `Write Firmware`, and select `R2X-7D8.BIN`.
 5. After flashing and rebooting, plug in USB and select USB Joystick mode.
 6. Under `MDL > 2/12 SETUP`, set `Trainer - Mode` to `Master/Serial`.
 7. Under `MDL > 10/12 SPECIAL FUNCTIONS`, create an entry for an unused switch,
@@ -103,7 +103,7 @@ EdgeTX recovery tools. Keep the radio powered during firmware updates.
 - `src\main.cpp` - native trainer/runtime executable.
 - `apps\Gx12.Launcher.Wpf` - primary WPF launcher, published as
   `Asukaflight.exe`.
-- `firmware\R2X-871.BIN` - validated GX12 firmware image.
+- `firmware\R2X-7D8.BIN` - current GX12 firmware image.
 - `firmware\edgetx-gx12-2.11.0` - EdgeTX-derived GX12 firmware source.
 - `firmware\experimental-tx16s` - untested TX16S/TX16S MK3 tester firmware.
 - `profiles\whoop-linear.toml` - current default profile.
@@ -141,7 +141,7 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File tools\publish-gx12-distribution.ps
 The script expects a current native runtime at
 `runtime\gx12mouse.exe`, publishes the WPF app, copies profiles and
 fixed UI sprites, strips `.pdb` files, runs the packaged self-test, adds the
-validated GX12 firmware as `firmware\R2X-871.BIN`, flash/run instructions, and
+current GX12 firmware as `firmware\R2X-7D8.BIN`, flash/run instructions, and
 a SHA256 manifest, then creates a flattened zip such as
 `dist\Asukaflight-0.9.0-p3-win-x64.zip`.
 Experimental TX16S/TX16S MK3 firmware candidates, when present, are packaged

@@ -13,14 +13,14 @@ shims, and Windows binary byproducts are intentionally not included.
 ## Validated Artifact
 
 ```text
-firmware\R2X-871.BIN
-SHA256 8717A5BE0DD1A536AC7F5718CCD3F50F4DA835B889DCCBF56EEB44AA19FED71A
-Size   545,016 bytes
+firmware\R2X-7D8.BIN
+SHA256 7D8FAE80FDC88E872832DEDAABB0DE3DCAC47125DC35386BE8FE5B9EE0FCE071
+Size   545,528 bytes
 ```
 
 The source workspace may keep longer local build-output filenames, but the
 public repo and distribution package expose the validated GX12 image as
-`firmware\R2X-871.BIN`.
+`firmware\R2X-7D8.BIN`.
 
 ## Experimental TX16S Artifacts
 
@@ -31,15 +31,15 @@ validated GX12 firmware, and are not guaranteed.
 ```text
 tx16s-asukaflight-composite-cdc-hid-resolution2x-2.11.0-EXPERIMENTAL-UNTESTED-EA8F1086.bin
 SHA256 EA8F1086A3935672AEB24C6E26A13C3C7A7366F7956580C6DF86B094772E779B
-Size   1,453,260 bytes
+Size   545,528 bytes
 
 tx16smk3-asukaflight-composite-cdc-hid-resolution2x-pre-3.0.0-EXPERIMENTAL-UNTESTED-8CC87AA0.uf2
 SHA256 8CC87AA0FAE6970D318EA2531C8A170E74CD0EB390D824855A9BC6CE7697B8E2
-Size   3,107,328 bytes
+Size   545,528 bytes
 
 tx16smk3-asukaflight-composite-cdc-hid-resolution2x-pre-3.0.0-EXPERIMENTAL-UNTESTED-326BF504.bin
 SHA256 326BF504E49DDB0F88922E987DD566FB1F8CB8B42673C20672F091D3021CDCDD
-Size   1,487,696 bytes
+Size   545,528 bytes
 ```
 
 ## Rebuild Recipe
@@ -106,7 +106,7 @@ Get-FileHash -Algorithm SHA256 -Path firmware\edgetx-gx12-2.11.0\build-fw-gx12-v
 Expected SHA256:
 
 ```text
-8717A5BE0DD1A536AC7F5718CCD3F50F4DA835B889DCCBF56EEB44AA19FED71A
+7D8FAE80FDC88E872832DEDAABB0DE3DCAC47125DC35386BE8FE5B9EE0FCE071
 ```
 
 `SOURCE_DATE_EPOCH=1777414649` and the prefix-map flags are required for

@@ -17,8 +17,8 @@ files intact when redistributing or modifying that tree.
 The validated firmware binary is:
 
 ```text
-firmware\R2X-871.BIN
-SHA256 8717A5BE0DD1A536AC7F5718CCD3F50F4DA835B889DCCBF56EEB44AA19FED71A
+firmware\R2X-7D8.BIN
+SHA256 7D8FAE80FDC88E872832DEDAABB0DE3DCAC47125DC35386BE8FE5B9EE0FCE071
 ```
 
 ## Third-Party Code

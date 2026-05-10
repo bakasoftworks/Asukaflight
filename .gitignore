@@ -35,7 +35,7 @@ edgetx-src*/
 *.pdf
 
 !firmware/
-!firmware/R2X-871.BIN
+!firmware/R2X-7D8.BIN
 !firmware/experimental-tx16s/
 !firmware/experimental-tx16s/*.bin
 !firmware/experimental-tx16s/*.uf2

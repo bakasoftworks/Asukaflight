@@ -2,7 +2,7 @@
 
 Validated GX12 firmware:
 
-- `R2X-871.BIN` - composite CDC/HID, 2x trainer-resolution GX12 firmware.
+- `R2X-7D8.BIN` - composite CDC/HID, 2x trainer-resolution GX12 firmware.
 
 Experimental tester firmware:
 

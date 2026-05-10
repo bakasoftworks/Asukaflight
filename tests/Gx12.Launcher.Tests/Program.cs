@@ -1520,11 +1520,11 @@ static void DistributionPublishScriptPackagesFirmwareAndReleaseBundle()
     var scriptPath = Path.Combine(FindRepoRoot(), "tools", "publish-gx12-distribution.ps1");
     var script = File.ReadAllText(scriptPath);
 
-    AssertTrue(script.Contains("firmware\\R2X-871.BIN", StringComparison.Ordinal),
-        "Distribution publish should use the validated short-name GX12 firmware by default.");
-    AssertTrue(script.Contains("8717A5BE0DD1A536AC7F5718CCD3F50F4DA835B889DCCBF56EEB44AA19FED71A", StringComparison.Ordinal),
-        "Distribution publish should pin the validated firmware hash.");
-    AssertTrue(script.Contains("R2X-871.BIN", StringComparison.Ordinal),
+    AssertTrue(script.Contains("firmware\\R2X-7D8.BIN", StringComparison.Ordinal),
+        "Distribution publish should use the current short-name GX12 firmware by default.");
+    AssertTrue(script.Contains("7D8FAE80FDC88E872832DEDAABB0DE3DCAC47125DC35386BE8FE5B9EE0FCE071", StringComparison.Ordinal),
+        "Distribution publish should pin the current firmware hash.");
+    AssertTrue(script.Contains("R2X-7D8.BIN", StringComparison.Ordinal),
         "Distribution publish should stage the tested radio firmware filename.");
     AssertTrue(!script.Contains("firmware\\FIRMWARE", StringComparison.Ordinal),
         "Distribution publish should not hide the GX12 firmware under a nested FIRMWARE folder.");

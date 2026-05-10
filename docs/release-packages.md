@@ -11,6 +11,13 @@ Build the firmware-included Windows package from the repo root:
 pwsh -NoProfile -ExecutionPolicy Bypass -File tools\publish-gx12-distribution.ps1
 ```
 
+When promoting a new validated GX12 firmware file, update the public docs,
+package script, staging script, and regression tests first:
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File tools\update-gx12-release-firmware.ps1 -FirmwarePath firmware\R2X-7D8.BIN
+```
+
 The script creates:
 
 - `dist\Asukaflight-<version-token>-win-x64\`
@@ -27,7 +34,7 @@ root. It does not contain a same-name wrapper folder.
 The package contains the self-contained WPF launcher, the native trainer
 runtime, profiles, fixed UI sprites, random tooltip sprites, release notes, the
 GPLv2 license file, the validated GX12 composite CDC/HID firmware under
-`firmware\R2X-871.BIN`. It
+`firmware\R2X-7D8.BIN`. It
 intentionally omits `.pdb` symbol files; rebuild locally when debugging with
 symbols is needed.
 
